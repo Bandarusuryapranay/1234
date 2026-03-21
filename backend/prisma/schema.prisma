@@ -1,0 +1,719 @@
+// ============================================================
+//  SmartHire AI — schema.prisma
+//  Database: PostgreSQL  |  ORM: Prisma
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+//  ENUMS
+// ============================================================
+
+enum Role {
+  ADMIN
+  RECRUITER
+  CANDIDATE
+}
+
+enum CampaignStatus {
+  DRAFT          // Admin is configuring
+  ACTIVE         // Accepting candidates
+  PAUSED         // Temporarily closed
+  CLOSED         // No new candidates
+  ARCHIVED       // Read-only historical
+}
+
+enum RoundType {
+  MCQ            // Multiple choice only
+  CODING         // Code execution only
+  INTERVIEW      // AI interview only
+  MIXED          // Blend of any types
+}
+
+enum InterviewMode {
+  TEXT           // Written Q&A
+  AUDIO          // Spoken Q&A via TTS + STT
+  LIVE_CODING    // Code editor + audio explanation of their code
+}
+
+enum TimerMode {
+  SHARED         // One countdown for entire session
+  PER_SLICE      // Each section has its own timer
+}
+
+enum Difficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum QuestionType {
+  MCQ
+  CODING
+  INTERVIEW_PROMPT
+}
+
+enum CandidateStatus {
+  LOCKED          // Created, not yet unlocked by recruiter
+  INVITED         // Credentials sent via Graph API
+  ONBOARDING      // Password not yet changed / resume not uploaded
+  READY           // Passed onboarding, can start assessment
+  IN_PROGRESS     // Currently taking the test
+  COMPLETED       // Finished all rounds
+  TERMINATED      // Watcher ended session (strike limit hit)
+  DISQUALIFIED    // Manual recruiter action
+  SHORTLISTED     // Recruiter moved to shortlist
+  REJECTED        // Recruiter rejected
+}
+
+enum AttemptStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  COMPLETED
+  TERMINATED      // Strike limit hit mid-attempt
+  TIMED_OUT       // Timer expired
+}
+
+enum ViolationType {
+  PHONE_DETECTED
+  FACE_AWAY
+  MULTIPLE_FACES
+  TAB_SWITCH
+  FOCUS_LOSS
+  BACKGROUND_VOICE
+  NO_FACE
+  FACE_MISMATCH
+}
+
+enum SessionStatus {
+  ACTIVE
+  COMPLETED
+  TERMINATED
+}
+
+enum PoolStatus {
+  GENERATING      // OpenAI call in progress
+  READY           // Available for use
+  REGENERATING    // Admin requested regeneration
+  DEPRECATED      // Superseded by a newer version
+}
+
+enum EmailStatus {
+  PENDING
+  SENT
+  FAILED
+  BOUNCED
+}
+
+// ============================================================
+//  USERS & AUTH
+// ============================================================
+
+model User {
+  id                String    @id @default(uuid())
+  email             String    @unique
+  passwordHash      String
+  role              Role
+  firstName         String
+  lastName          String
+  isActive          Boolean   @default(true)
+  mustChangePassword Boolean  @default(false)
+  lastLoginAt       DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  // Relations by role
+  adminProfile      AdminProfile?
+  recruiterProfile  RecruiterProfile?
+  candidateProfile  CandidateProfile?
+
+  // Auth
+  jwtBlacklist      JWTBlacklist[]
+  refreshTokens     RefreshToken[]
+
+  @@index([email])
+  @@index([role])
+}
+
+model AdminProfile {
+  id          String  @id @default(uuid())
+  userId      String  @unique
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  department  String?
+  campaigns   Campaign[]
+}
+
+model RecruiterProfile {
+  id          String  @id @default(uuid())
+  userId      String  @unique
+  user        User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  department  String?
+
+  // Campaigns this recruiter manages
+  assignments CampaignRecruiter[]
+}
+
+model CandidateProfile {
+  id              String          @id @default(uuid())
+  userId          String          @unique
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  phone           String?
+  resumeUrl       String?         // Uploaded PDF
+  resumeText      String?         // Extracted text for AI analysis
+  status          CandidateStatus @default(LOCKED)
+  isForwarded     Boolean         @default(false)
+  adminDecision   String?
+
+  // Which campaign this candidate belongs to
+  campaignId      String
+  campaign        Campaign        @relation(fields: [campaignId], references: [id])
+
+  // Assessment
+  attempts        CandidateAttempt[]
+  scorecard       ScoreCard?
+  strikeLog       StrikeEvent[]
+  emailLog        EmailLog[]
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  // Biometric Enrollment
+  faceDescriptor      Json?
+  enrollmentPhotoUrl  String?
+  enrolledAt          DateTime?
+
+  // Proctoring Sessions & Violations
+  proctoringSessions  Session[]
+  newViolations       Violation[]
+
+  @@index([campaignId])
+  @@index([status])
+}
+
+// ============================================================
+//  JWT SECURITY
+// ============================================================
+
+model JWTBlacklist {
+  id          String   @id @default(uuid())
+  token       String   @unique
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reason      String?  // e.g. "STRIKE_TERMINATION", "LOGOUT", "PASSWORD_CHANGE"
+  expiresAt   DateTime // mirrors the JWT exp — for cleanup jobs
+  createdAt   DateTime @default(now())
+
+  @@index([token])
+  @@index([expiresAt])
+}
+
+model RefreshToken {
+  id          String   @id @default(uuid())
+  token       String   @unique
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  @@index([token])
+}
+
+// ============================================================
+//  CAMPAIGNS
+// ============================================================
+
+model Campaign {
+  id              String          @id @default(uuid())
+  name            String
+  role            String          // Job title
+  department      String?
+  jobDescription  String          // Full JD text — AI anchor
+  jdFileUrl       String?         // Optional uploaded JD PDF
+  status          CampaignStatus  @default(DRAFT)
+  expiresAt       DateTime?
+  maxCandidates   Int?
+
+  // Who created it
+  adminId         String
+  admin           AdminProfile    @relation(fields: [adminId], references: [id])
+
+  // Pipeline configuration stored as structured JSONB
+  // Shape: { timerMode, rounds: [...], proctoring: {...} }
+  pipelineConfig  Json
+
+  // Relations
+  recruiters      CampaignRecruiter[]
+  candidates      CandidateProfile[]
+  questionPools   QuestionPool[]
+  rounds          PipelineRound[]
+  attempts        CandidateAttempt[]
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([status])
+  @@index([adminId])
+}
+
+// Many-to-many: Campaign <-> Recruiter
+model CampaignRecruiter {
+  id              String           @id @default(uuid())
+  campaignId      String
+  campaign        Campaign         @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  recruiterId     String
+  recruiter       RecruiterProfile @relation(fields: [recruiterId], references: [id], onDelete: Cascade)
+  assignedAt      DateTime         @default(now())
+
+  @@unique([campaignId, recruiterId])
+}
+
+// ============================================================
+//  PIPELINE ROUNDS
+//  Ordered list of rounds for a campaign.
+//  For a MIXED round, sliceConfig holds the sub-type breakdown.
+// ============================================================
+
+model PipelineRound {
+  id              String        @id @default(uuid())
+  campaignId      String
+  campaign        Campaign      @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  order           Int           // 1, 2, 3 — defines sequence
+  roundType       RoundType
+
+  // ── MCQ-specific ──────────────────────────────────────────
+  // totalQuestions, timeLimitMinutes, passMarkPercent,
+  // shuffleQuestions, negativeMarking, penaltyPerWrong,
+  // difficultyEasy%, difficultyMedium%, difficultyHard%
+
+  // ── CODING-specific ───────────────────────────────────────
+  // problemCount, timeLimitMinutes, allowedLanguages[],
+  // difficultyEasy%, difficultyMedium%, difficultyHard%
+
+  // ── INTERVIEW-specific ────────────────────────────────────
+  // questionCount, maxAnswerTimeMinutes, mode (TEXT|AUDIO),
+  // depth (SHALLOW|DEEP), followUpEnabled,
+  // ttsVoice (for AUDIO mode)
+
+  // ── MIXED-specific ────────────────────────────────────────
+  // timerMode (SHARED|PER_SLICE), totalTimeLimitMinutes,
+  // slices: [{ type, count, timeLimitMinutes, ... }]
+
+  roundConfig     Json          // Full typed config for this round
+  interviewMode   InterviewMode? // Only set when roundType = INTERVIEW or MIXED with interview slice
+
+  // Timer at round level
+  timerMode       TimerMode     @default(SHARED)
+  timeLimitMinutes Int?         // For SHARED timer
+
+  // Pass/fail
+  passMarkPercent Float?        // For MCQ
+  failAction      String        @default("MANUAL_REVIEW") // AUTO_REJECT | MANUAL_REVIEW
+
+  // Question pool generated for this round
+  questionPool    QuestionPool?
+
+  // Attempts on this round
+  attempts        CandidateAttempt[]
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@unique([campaignId, order])
+  @@index([campaignId])
+}
+
+// ============================================================
+//  QUESTION POOL (AI-Generated, Versioned)
+// ============================================================
+
+model QuestionPool {
+  id              String      @id @default(uuid())
+  campaignId      String
+  campaign        Campaign    @relation(fields: [campaignId], references: [id])
+  roundId         String      @unique
+  round           PipelineRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  version         Int         @default(1)
+  status          PoolStatus  @default(GENERATING)
+
+  // Generation metadata
+  generatedBy     String      // "openai-gpt-4o"
+  generationPrompt String?    // Stored for audit / regeneration
+  generatedAt     DateTime?
+
+  // Pool is 2-3x the configured count so each candidate gets a unique draw
+  questions       Question[]
+
+  // Admin review
+  adminApproved   Boolean     @default(false)
+  approvedAt      DateTime?
+  rejectedQIds    String[]    @default([]) // IDs admin rejected
+
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@index([campaignId])
+  @@index([status])
+}
+
+// ============================================================
+//  QUESTIONS
+// ============================================================
+
+model Question {
+  id              String       @id @default(uuid())
+  poolId          String
+  pool            QuestionPool @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  type            QuestionType
+  difficulty      Difficulty
+  topicTag        String?      // e.g. "React hooks", "SQL joins" — extracted from JD
+  order           Int?         // Within pool
+  marksAwarded    Float        @default(1)
+
+  // ── MCQ fields ───────────────────────────────────────────
+  stem            String?      // The question text
+  options         Json?        // [{ id, text, isCorrect }]
+  explanation     String?      // Shown after submission
+
+  // ── CODING fields ─────────────────────────────────────────
+  problemTitle    String?
+  problemStatement String?
+  constraints     String?
+  examples        Json?        // [{ input, output, explanation }]
+  testCases       Json?        // [{ input, expectedOutput, isHidden }]
+  starterCode     Json?        // { javascript, python, java, ... }
+  solutionCode    Json?        // Admin reference (never sent to candidate)
+
+  // ── INTERVIEW PROMPT fields ───────────────────────────────
+  prompt          String?      // The question asked by AI interviewer
+  evaluationRubric String?     // What a good answer covers
+  followUpPrompts Json?        // [{ trigger, prompt }] — conditional follow-ups
+
+  // ── LIVE_CODING fields (interview mode = LIVE_CODING) ────────
+  liveCodingProblem    String?   // The coding problem description
+  liveCodingTestCases  Json?     // Basic test cases to run
+  liveCodingStarter    Json?     // { javascript, python, ... } starter code
+  explanationPrompt    String?   // "Explain your solution..." follow-up
+  explanationRubric    String?   // What a good explanation covers
+
+  isActive        Boolean      @default(true) // false = admin rejected
+  createdAt       DateTime     @default(now())
+
+  // Answers referencing this question
+  mcqAnswers      MCQAnswer[]
+  codingSubmissions CodingSubmission[]
+  interviewAnswers InterviewAnswer[]
+
+  @@index([poolId])
+  @@index([type, difficulty])
+}
+
+// ============================================================
+//  CANDIDATE ATTEMPTS
+//  One attempt per pipeline round per candidate.
+// ============================================================
+
+model CandidateAttempt {
+  id                String          @id @default(uuid())
+  candidateId       String
+  candidate         CandidateProfile @relation(fields: [candidateId], references: [id])
+  roundId           String
+  round             PipelineRound    @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  campaignId        String
+  campaign          Campaign         @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  status            AttemptStatus   @default(NOT_STARTED)
+
+  // Drawn questions for this specific attempt (unique per candidate)
+  assignedQuestionIds String[]
+
+  // Timing
+  startedAt         DateTime?
+  completedAt       DateTime?
+  terminatedAt      DateTime?
+  timeLimitMinutes  Int?
+
+  // Proctoring
+  strikeCount       Int             @default(0)
+  maxStrikes        Int             @default(3)
+  strikeEvents      StrikeEvent[]
+
+  // Answers
+  mcqAnswers        MCQAnswer[]
+  codingSubmissions CodingSubmission[]
+  interviewAnswers  InterviewAnswer[]
+
+  // Recording
+  recording         AttemptRecording?
+
+  // Scoring
+  rawScore          Float?
+  maxScore          Float?
+  percentScore      Float?
+  passed            Boolean?
+
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  @@index([candidateId])
+  @@index([campaignId])
+  @@index([status])
+}
+
+// ============================================================
+//  ANSWERS
+// ============================================================
+
+model MCQAnswer {
+  id              String           @id @default(uuid())
+  attemptId       String
+  attempt         CandidateAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  questionId      String
+  question        Question         @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  selectedOptionId String?         // null = unattempted
+  isCorrect       Boolean?
+  marksAwarded    Float?
+  timeTakenSeconds Int?
+  answeredAt      DateTime         @default(now())
+
+  @@unique([attemptId, questionId])
+  @@index([attemptId])
+}
+
+model CodingSubmission {
+  id              String           @id @default(uuid())
+  attemptId       String
+  attempt         CandidateAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  questionId      String
+  question        Question         @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  language        String           // "javascript", "python", "java", "cpp"
+  sourceCode      String
+  submittedAt     DateTime         @default(now())
+
+  // Judge0 execution result
+  judge0Token     String?          // Judge0 submission token
+  stdout          String?
+  stderr          String?
+  compileOutput   String?
+  statusId        Int?             // Judge0 status code
+  statusDesc      String?          // "Accepted", "Wrong Answer", etc.
+  timeTakenMs     Float?
+  memoryUsedKb    Float?
+
+  // Test case results
+  testCaseResults Json?            // [{ caseId, passed, actualOutput }]
+  testCasesPassed Int?
+  testCasesTotal  Int?
+  marksAwarded    Float?
+
+  @@index([attemptId])
+}
+
+model InterviewAnswer {
+  id              String           @id @default(uuid())
+  attemptId       String
+  attempt         CandidateAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  questionId      String
+  question        Question         @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  mode            InterviewMode    // TEXT or AUDIO
+
+  // Text mode
+  textAnswer      String?
+
+  // Audio mode
+  audioUrl        String?          // Stored recording of this answer
+  sttTranscript   String?          // Speech-to-text output
+  sttConfidence   Float?
+
+  // AI evaluation
+  aiScore         Float?           // 0-10
+  aiReasoning     String?          // Why this score
+  aiFollowUpAsked String?          // The follow-up question generated (if any)
+  aiFollowUpAnswer String?         // Candidate's follow-up response
+
+  // LIVE_CODING mode fields
+  codeSubmission  String?          // The code candidate wrote
+  codeLanguage    String?          // Language used
+  codeScore       Float?           // 0-10 from Judge0 test cases
+  explainAudio    String?          // Audio URL of explanation
+  explainTranscript String?        // Whisper transcript of explanation
+  explainScore    Float?           // 0-10 AI evaluation of explanation
+
+  timeTakenSeconds Int?
+  answeredAt      DateTime         @default(now())
+
+  @@index([attemptId])
+}
+
+// ============================================================
+//  PROCTORING
+// ============================================================
+
+model StrikeEvent {
+  id              String           @id @default(uuid())
+  candidateId     String
+  candidate       CandidateProfile @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  attemptId       String
+  attempt         CandidateAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  violationType   ViolationType
+  strikeNumber    Int              // 1, 2, 3 — cumulative count at time of event
+  isStrike        Boolean          @default(true) // false = flagged but not a strike (e.g. background voice)
+  screenshotUrl   String?          // Frame captured at moment of violation
+  mediapipeScore  Float?           // Confidence score from MediaPipe
+  metadata        Json?            // Extra context (e.g. bounding box, audio amplitude)
+  occurredAt      DateTime         @default(now())
+
+  @@index([candidateId])
+  @@index([attemptId])
+}
+
+model AttemptRecording {
+  id                    String           @id @default(uuid())
+  attemptId             String           @unique
+  attempt               CandidateAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+
+  // Storage URLs (cloud bucket)
+  videoUrl              String?          // Full session video
+  audioUrl              String?          // Extracted audio track
+  sttFullTranscript     String?          // Full STT for audio-mode interview
+  sttFullConfidence     Float?
+
+  // MediaPipe event log
+  mediapipeLog          Json             @default("[]")
+  // Shape: [{ timestamp, type, confidence, screenshotUrl }]
+
+  // Background voice flags (not necessarily strikes)
+  backgroundVoiceFlags  Json             @default("[]")
+  // Shape: [{ timestamp, durationMs, amplitude }]
+
+  // Metadata
+  durationSeconds       Int?
+  videoSizeBytes        BigInt?
+  audioSizeBytes        BigInt?
+  recordingStartedAt    DateTime?
+  recordingEndedAt      DateTime?
+
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+}
+
+// ── NEW PROCTORING MODELS ─────────────────────────────────
+
+model Session {
+  id                String           @id @default(uuid())
+  candidateId       String
+  candidate         CandidateProfile @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  status            SessionStatus    @default(ACTIVE)
+  terminatedAt      DateTime?
+  terminationReason String?
+  violations        Violation[]
+  createdAt         DateTime         @default(now())
+
+  @@index([candidateId])
+}
+
+model Violation {
+  id              String           @id @default(uuid())
+  type            ViolationType
+  candidateId     String
+  candidate       CandidateProfile @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  sessionId       String?
+  session         Session?          @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  screenshotUrl   String?
+  isStrike        Boolean          @default(true)
+  detectedAt      DateTime         @default(now())
+
+  @@index([candidateId])
+  @@index([sessionId])
+}
+
+// ============================================================
+//  SCORING & GAP ANALYSIS
+// ============================================================
+
+model ScoreCard {
+  id                  String           @id @default(uuid())
+  candidateId         String           @unique
+  candidate           CandidateProfile @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  campaignId          String
+
+  // Per-round scores
+  roundScores         Json             @default("[]")
+  // Shape: [{ roundId, roundType, rawScore, maxScore, percent, passed }]
+
+  // AI Gap Analysis (post-assessment OpenAI call)
+  technicalFitPercent Float?           // 0-100
+  trustScore          Float?           // 0-100 (composite: scores + proctoring)
+
+  // Trust score breakdown
+  strikeDeduction     Float?           // Points deducted for strikes
+  completionBonus     Float?           // Bonus for completing all rounds
+  consistencyScore    Float?           // Scores consistent across rounds
+
+  // Gap Analysis narrative
+  gapAnalysis         Json?
+  // Shape: {
+  //   strengths: string[],
+  //   gaps: string[],
+  //   jdMatchedSkills: string[],
+  //   jdMissingSkills: string[],
+  //   aiSummary: string
+  // }
+
+  // Recruiter notes
+  recruiterNotes      String?
+  recruiterRating     Int?             // 1-5
+
+  generatedAt         DateTime?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  @@index([campaignId])
+}
+
+// ============================================================
+//  EMAIL LOG
+// ============================================================
+
+model EmailLog {
+  id              String            @id @default(uuid())
+  candidateId     String?
+  candidate       CandidateProfile? @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  toEmail         String
+  subject         String
+  templateName    String           // "CREDENTIALS", "REMINDER", "RESULT"
+  status          EmailStatus      @default(PENDING)
+  graphMessageId  String?          // Microsoft Graph message ID
+  sentAt          DateTime?
+  failureReason   String?
+  createdAt       DateTime         @default(now())
+
+  @@index([candidateId])
+  @@index([status])
+}
+
+// ============================================================
+//  AUDIT LOG
+// ============================================================
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  actorId     String?  // null = system
+  actorRole   Role?
+  action      String   // e.g. "CAMPAIGN_CREATED", "CANDIDATE_TERMINATED"
+  entityType  String   // e.g. "Campaign", "CandidateProfile"
+  entityId    String
+  metadata    Json?    // Before/after state or extra context
+  ipAddress   String?
+  userAgent   String?
+  occurredAt  DateTime @default(now())
+
+  @@index([actorId])
+  @@index([entityType, entityId])
+  @@index([occurredAt])
+}

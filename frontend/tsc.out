@@ -1,0 +1,6 @@
+src/components/ProctoringCamera.tsx(1,8): error TS6133: 'React' is declared but its value is never read.
+src/components/ProctoringCamera.tsx(38,5): error TS2345: Argument of type 'RefObject<HTMLVideoElement | null>' is not assignable to parameter of type 'RefObject<HTMLVideoElement>'.
+  Type 'HTMLVideoElement | null' is not assignable to type 'HTMLVideoElement'.
+    Type 'null' is not assignable to type 'HTMLVideoElement'.
+src/pages/admin/AdminScorecardPage.tsx(96,87): error TS2554: Expected 1-2 arguments, but got 0.
+src/pages/candidate/AssessmentLayout.tsx(14,10): error TS6133: 'terminated' is declared but its value is never read.

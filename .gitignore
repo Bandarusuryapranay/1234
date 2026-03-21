@@ -1,0 +1,13 @@
+# Ignore node_modules and build directories
+**/node_modules/
+**/build/
+
+# Ignore android folder in int300 directory
+int300/android/
+
+# Optionally ignore other temp files (common)
+*.log
+.DS_Store
+.env
+dist/
+coverage/
