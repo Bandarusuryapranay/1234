@@ -88,6 +88,10 @@ export const questionApi = {
     api.get(`/questions/preview/${campaignId}`).then((r) => r.data),
   approveQuestion: (questionId: string, approved: boolean) =>
     api.patch('/questions/approve', { questionId, approved }).then((r) => r.data),
+  bulkApprove: (poolId: string, approve: boolean) =>
+    api.patch('/questions/bulk-approve', { poolId, approve }).then((r) => r.data),
+  getApprovalStatus: (campaignId: string) =>
+    api.get(`/questions/approval-status/${campaignId}`).then((r) => r.data),
 }
 
 // ── Candidate ─────────────────────────────────────────────────
@@ -132,6 +136,10 @@ export const attemptApi = {
     sttTranscript?: string,
     timeTakenSeconds: number 
   }) => api.post('/attempt/submit/interview', data).then(r => r.data),
+   submitInterviewAudio: (formData: FormData) =>
+    api.post('/attempt/submit/interview', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    }).then(r => r.data),
   submitLiveCodingCode: (data: { attemptId: string, questionId: string, sourceCode: string, language: string }) =>
     api.post('/attempt/live-coding/code', data).then(r => r.data),
   submitLiveCodingExplain: (formData: FormData) =>

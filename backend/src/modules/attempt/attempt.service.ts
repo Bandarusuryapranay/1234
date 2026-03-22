@@ -16,79 +16,21 @@ import type {
 
 // ── FIX 4: startAttempt — correct pool + resume personalisation ─
 export async function startAttempt(candidateId: string, input: StartAttemptInput) {
-  // ── 1. Fetch candidate + existing attempt in PARALLEL ──────────────────────
-  const [candidate, existing] = await Promise.all([
-    prisma.candidateProfile.findUniqueOrThrow({
-      where:   { id: candidateId },
-      include: { campaign: { include: { rounds: true } } },
-    }),
-    prisma.candidateAttempt.findFirst({
-      where: { candidateId, roundId: input.roundId, status: { in: ['IN_PROGRESS', 'COMPLETED'] } },
-    }),
-  ])
+  const candidate = await prisma.candidateProfile.findUniqueOrThrow({
+    where:   { id: candidateId },
+    include: { campaign: { include: { rounds: true } } },
+  })
 
   if (!['READY', 'IN_PROGRESS'].includes(candidate.status)) {
     throw { status: 400, message: 'Candidate is not ready to start assessment' }
   }
 
-  if (existing) {
-    if (existing.status === 'IN_PROGRESS') {
-      // Re-fetch assigned questions so the frontend can render them
-      const assignedIds = (existing.assignedQuestionIds as string[]) || []
-      const [resumeQuestions, resumeRound, resumeSession] = await Promise.all([
-        prisma.question.findMany({
-          where: { id: { in: assignedIds } },
-        }),
-        prisma.pipelineRound.findUnique({
-          where: { id: input.roundId },
-          select: { roundConfig: true, roundType: true },
-        }),
-        prisma.session.create({ data: { candidateId } }),
-      ])
+  const existing = await prisma.candidateAttempt.findFirst({
+    where: { candidateId, roundId: input.roundId, status: { in: ['IN_PROGRESS', 'COMPLETED'] } },
+  })
+  if (existing) throw { status: 409, message: 'Attempt already exists for this round', code: 'ALREADY_STARTED' }
 
-      // Preserve original order from assignedQuestionIds
-      const ordered = assignedIds
-        .map(id => resumeQuestions.find(q => q.id === id))
-        .filter(Boolean) as typeof resumeQuestions
-
-      const resumeConfig = (resumeRound?.roundConfig as any) || {}
-
-      const safeResumeQuestions = ordered.map((q: any) => ({
-        id:               q.id,
-        type:             q.type,
-        difficulty:       q.difficulty,
-        topicTag:         q.topicTag,
-        stem:             q.stem,
-        options:          q.options?.map((o: any) => ({ id: o.id, text: o.text })),
-        problemTitle:     q.problemTitle,
-        problemStatement: q.problemStatement,
-        constraints:      q.constraints,
-        examples:         q.examples,
-        starterCode:      q.starterCode,
-        prompt:           q.prompt,
-        liveCodingProblem:    q.liveCodingProblem,
-        liveCodingTestCases:  (q.liveCodingTestCases as any[])?.filter((tc: any) => !tc.isHidden),
-        liveCodingStarter:    q.liveCodingStarter,
-        explanationPrompt:    q.explanationPrompt,
-        marksAwarded:         q.marksAwarded,
-        interviewMode:        resumeConfig.interviewMode,
-      }))
-
-      return {
-        attempt: existing,
-        questions: safeResumeQuestions,
-        sessionId: resumeSession.id,
-        faceDescriptor: (candidate as any).faceDescriptor,
-        interviewMode: resumeConfig.interviewMode ?? null,
-        message: 'Resuming existing attempt',
-      }
-    }
-    if (existing.status === 'COMPLETED') {
-      throw { status: 409, message: 'You have already completed this round.', attemptId: existing.id }
-    }
-  }
-
-  // ── 2. Fetch round + question pool ─────────────────────────────────────────
+  // FIX 4: include pool + questions
   const round = await prisma.pipelineRound.findUniqueOrThrow({
     where:   { id: input.roundId },
     include: {
@@ -104,9 +46,11 @@ export async function startAttempt(candidateId: string, input: StartAttemptInput
 
   const roundConfig   = round.roundConfig as any
   const isInterview   = round.roundType === 'INTERVIEW'
+  const isLiveCoding  = roundConfig.interviewMode === 'LIVE_CODING'
   const resumeSplit   = roundConfig.resumeSplit || 0
 
-  // ── 3. Resume personalisation (INTERVIEW only) ────────────────────────────
+  // ── RESUME PERSONALISATION: re-generate questions per candidate ──
+  // Only for interview rounds where admin configured resumeSplit > 0
   let poolQuestions = round.questionPool.questions
 
   if (isInterview && resumeSplit > 0 && candidate.resumeText) {
@@ -117,19 +61,25 @@ export async function startAttempt(candidateId: string, input: StartAttemptInput
         roundConfig,
         candidate.resumeText
       )
+
+      // Create temporary questions just for this candidate — stored in a
+      // candidate-specific pool override (we reuse the pool table with a flag)
       const questionCount = roundConfig.questionCount || 5
+      // Use AI-generated personalised questions instead of pool
+      // They are ephemeral — created now, assigned to this attempt
       const createdQuestions = await prisma.$transaction(
         personalised.slice(0, Math.ceil(questionCount * 1.5)).map((q: any) =>
           prisma.question.create({
             data: {
               poolId:           round.questionPool!.id,
-              type:             'INTERVIEW_PROMPT',
+              type: 'INTERVIEW_PROMPT',
               difficulty:       q.difficulty || 'MEDIUM',
               topicTag:         q.topicTag,
-              order:            999,
+              order:            999, // high order = candidate-personalised
               prompt:           q.prompt,
               evaluationRubric: q.evaluationRubric,
               followUpPrompts:  q.followUpPrompts,
+              // LIVE_CODING fields
               liveCodingProblem:   q.liveCodingProblem,
               liveCodingTestCases: q.liveCodingTestCases,
               liveCodingStarter:   q.liveCodingStarter,
@@ -142,6 +92,7 @@ export async function startAttempt(candidateId: string, input: StartAttemptInput
       )
       poolQuestions = createdQuestions
     } catch (err) {
+      // Fall back to base pool if personalisation fails
       console.warn('[Attempt] Resume personalisation failed, using base pool:', err)
     }
   }
@@ -150,73 +101,63 @@ export async function startAttempt(candidateId: string, input: StartAttemptInput
     throw { status: 400, message: 'No questions available. Ask admin to regenerate the pool.' }
   }
 
-  let questionCount = 10;
-  if (round.roundType === 'MCQ')     questionCount = roundConfig.totalQuestions || roundConfig.questionCount || 10;
-  if (round.roundType === 'CODING')  questionCount = roundConfig.problemCount || 2; // Default 2 for coding if not set
-  if (round.roundType === 'INTERVIEW') questionCount = roundConfig.questionCount || 5;
-
+  const questionCount  = roundConfig.totalQuestions || roundConfig.problemCount || roundConfig.questionCount || 10
   const drawnQuestions = drawQuestions(poolQuestions, questionCount, roundConfig)
   const proctoring     = (candidate.campaign.pipelineConfig as any)?.proctoring || {}
 
-  // ── 4. Batch all writes in a single transaction ───────────────────────────
-  const [attempt, , session] = await prisma.$transaction([
-    prisma.candidateAttempt.create({
-      data: {
-        candidateId,
-        roundId:             input.roundId,
-        campaignId:          candidate.campaignId,
-        status:              'IN_PROGRESS',
-        startedAt:           new Date(),
-        timeLimitMinutes:    round.timeLimitMinutes,
-        maxStrikes:          proctoring.maxStrikes || 3,
-        assignedQuestionIds: drawnQuestions.map((q: any) => q.id),
-      },
-    }),
-    // Conditional profile update — run unconditionally in tx for simplicity
-    prisma.candidateProfile.update({
+  const attempt = await prisma.candidateAttempt.create({
+    data: {
+      candidateId,
+      roundId:             input.roundId,
+      campaignId:          candidate.campaignId,
+      status:              'IN_PROGRESS',
+      startedAt:           new Date(),
+      timeLimitMinutes:    round.timeLimitMinutes,
+      maxStrikes:          proctoring.maxStrikes || 3,
+      assignedQuestionIds: drawnQuestions.map((q: any) => q.id),
+    },
+  })
+
+  await prisma.attemptRecording.create({
+    data: { attemptId: attempt.id, recordingStartedAt: new Date() },
+  }).catch(() => {})
+
+  if (candidate.status === 'READY') {
+    await prisma.candidateProfile.update({
       where: { id: candidateId },
-      data:  { status: candidate.status === 'READY' ? 'IN_PROGRESS' : candidate.status },
-    }),
-    prisma.session.create({ data: { candidateId } }),
-  ])
+      data:  { status: 'IN_PROGRESS' },
+    })
+  }
 
-  // AttemptRecording is fire-and-forget — create after tx so it never blocks
-  prisma.attemptRecording
-    .create({ data: { attemptId: attempt.id, recordingStartedAt: new Date() } })
-    .catch(() => {})
-
-  // ── 5. Strip sensitive fields ──────────────────────────────────────────────
+  // Strip sensitive fields
   const safeQuestions = drawnQuestions.map((q: any) => ({
     id:               q.id,
     type:             q.type,
     difficulty:       q.difficulty,
     topicTag:         q.topicTag,
+    // MCQ
     stem:             q.stem,
     options:          q.options?.map((o: any) => ({ id: o.id, text: o.text })),
+    // Coding
     problemTitle:     q.problemTitle,
     problemStatement: q.problemStatement,
     constraints:      q.constraints,
     examples:         q.examples,
     starterCode:      q.starterCode,
+    // Interview
     prompt:           q.prompt,
+    // LIVE_CODING (send problem but not hidden rubric)
     liveCodingProblem:  q.liveCodingProblem,
     liveCodingTestCases: (q.liveCodingTestCases as any[])?.filter((tc: any) => !tc.isHidden),
     liveCodingStarter:  q.liveCodingStarter,
     explanationPrompt:  q.explanationPrompt,
     marksAwarded:     q.marksAwarded,
+    // Metadata
     interviewMode:    roundConfig.interviewMode,
   }))
 
-  return {
-    attempt,
-    questions: safeQuestions,
-    sessionId: session.id,
-    faceDescriptor: (candidate as any).faceDescriptor,
-    interviewMode: roundConfig.interviewMode
-  }
+  return { attempt, questions: safeQuestions, interviewMode: roundConfig.interviewMode }
 }
-
-
 
 // ── Time enforcement ──────────────────────────────────────────
 async function enforceTimeLimit(attemptId: string): Promise<void> {
@@ -285,30 +226,6 @@ export async function submitCodingAnswer(input: SubmitCodingInput) {
   return { ...submission, message: 'Submission received. Test cases running.' }
 }
 
-export async function runCodingTestCases(input: SubmitCodingInput) {
-  await enforceTimeLimit(input.attemptId)
-
-  const question = await prisma.question.findUniqueOrThrow({
-    where:  { id: input.questionId },
-    select: { testCases: true, liveCodingTestCases: true },
-  })
-
-  const allTestCases = (question.testCases as any[] || question.liveCodingTestCases as any[] || [])
-  const publicTestCases = allTestCases.filter(tc => !tc.isHidden)
-
-  if (publicTestCases.length === 0) {
-    throw { status: 400, message: 'No public test cases defined for this problem.' }
-  }
-
-  const results = await runTestCases({ 
-    sourceCode: input.sourceCode, 
-    language: input.language, 
-    testCases: publicTestCases 
-  })
-
-  return results
-}
-
 async function runTestCasesWithRetry(submissionId: string, input: SubmitCodingInput, testCases: any[], attempt = 1) {
   try {
     const results = await runTestCases({ sourceCode: input.sourceCode, language: input.language, testCases })
@@ -324,7 +241,10 @@ async function runTestCasesWithRetry(submissionId: string, input: SubmitCodingIn
 }
 
 // ── Submit Interview (TEXT / AUDIO) ───────────────────────────
-export async function submitInterviewAnswer(input: SubmitInterviewInput) {
+export async function submitInterviewAnswer(
+  input: SubmitInterviewInput,
+  audioBuffer?: Buffer,  // optional raw audio from multipart upload
+) {
   await enforceTimeLimit(input.attemptId)
 
   const question = await prisma.question.findUniqueOrThrow({
@@ -337,9 +257,20 @@ export async function submitInterviewAnswer(input: SubmitInterviewInput) {
     include: { candidate: { include: { campaign: { select: { role: true } } } } },
   })
 
-  const answerText = input.textAnswer || input.sttTranscript || ''
+  // Transcribe audio if AUDIO mode and buffer provided
+  let sttTranscript = input.sttTranscript || ''
+  if (audioBuffer && audioBuffer.length > 0 && !sttTranscript) {
+    try {
+      const result = await transcribeAudio(audioBuffer)
+      sttTranscript = result.text
+    } catch (err) {
+      console.warn('[InterviewAnswer] Whisper transcription failed:', err)
+    }
+  }
 
-  // Extract category from topicTag (e.g. "jd: React hooks" or "resume: Infosys project")
+  const answerText = input.textAnswer || sttTranscript || ''
+
+  // Extract category from topicTag
   const topicTag = question.topicTag || ''
   const category = topicTag.startsWith('resume:') ? 'RESUME_DRILL'
     : (question.followUpPrompts as any[])?.[0]?.category || undefined
@@ -353,6 +284,14 @@ export async function submitInterviewAnswer(input: SubmitInterviewInput) {
     topicTag,
   })
 
+  // Combine content score (AI) + delivery score (frontend computed)
+  // Content = 75% weight, Delivery = 25% weight for AUDIO mode
+  const contentScore  = evaluation.score
+  const deliveryScore = input.deliveryScore ?? null
+  const finalScore    = deliveryScore !== null
+    ? (contentScore * 0.75) + (deliveryScore * 0.25)
+    : contentScore
+
   return prisma.interviewAnswer.create({
     data: {
       attemptId:        input.attemptId,
@@ -360,11 +299,22 @@ export async function submitInterviewAnswer(input: SubmitInterviewInput) {
       mode:             input.textAnswer ? 'TEXT' : 'AUDIO',
       textAnswer:       input.textAnswer,
       audioUrl:         input.audioUrl,
-      sttTranscript:    input.sttTranscript,
-      aiScore:          evaluation.score,
-      aiReasoning:      evaluation.reasoning,
+      sttTranscript:    sttTranscript || input.sttTranscript,
+      aiScore:          finalScore,
+      aiReasoning:      deliveryScore !== null
+        ? `Content: ${contentScore.toFixed(1)}/10 | Delivery: ${deliveryScore.toFixed(1)}/10 | Combined: ${finalScore.toFixed(1)}/10\n\n${evaluation.reasoning}`
+        : evaluation.reasoning,
       aiFollowUpAsked:  evaluation.followUp,
       timeTakenSeconds: input.timeTakenSeconds,
+      // Delivery metrics
+      durationSeconds:  input.durationSeconds,
+      speechDuration:   input.speechDuration,
+      silenceRatio:     input.silenceRatio,
+      wordsPerMinute:   input.wordsPerMinute,
+      wordCount:        input.wordCount,
+      fillerWordCount:  input.fillerWordCount,
+      fillerWordRatio:  input.fillerWordRatio,
+      deliveryScore:    deliveryScore,
     },
   })
 }
@@ -418,11 +368,10 @@ export async function submitLiveCodingCode(input: SubmitLiveCodingInput) {
 // ── Submit LIVE_CODING — Phase 2: submit audio explanation ────
 // Called after candidate records their explanation
 export async function submitLiveCodingExplanation(input: {
-  attemptId: string,
-  answerId:  string,
-  questionId:string,
-  audioUrl?:  string,
-  audioBuffer?: Buffer,
+  attemptId:   string
+  answerId:    string
+  questionId:  string
+  audioBuffer: Buffer  // raw audio from MediaRecorder
 }) {
   await enforceTimeLimit(input.attemptId)
 
@@ -441,21 +390,8 @@ export async function submitLiveCodingExplanation(input: {
     include: { candidate: { include: { campaign: { select: { role: true } } } } },
   })
 
-  // Get audio buffer
-  let audioBuffer: Buffer
-  if (input.audioBuffer) {
-    audioBuffer = input.audioBuffer
-  } else if (input.audioUrl) {
-    const response = await fetch(input.audioUrl)
-    if (!response.ok) throw new Error('Failed to download audio from ' + input.audioUrl)
-    const arrayBuffer = await response.arrayBuffer()
-    audioBuffer = Buffer.from(arrayBuffer)
-  } else {
-    throw new Error('No audio source provided')
-  }
-
   // Step 1: Transcribe audio via Groq Whisper
-  const { text: transcript } = await transcribeAudio(audioBuffer)
+  const { text: transcript } = await transcribeAudio(input.audioBuffer)
 
   // Step 2: AI evaluates explanation against actual code
   const evaluation = await evaluateCodeExplanation({
@@ -470,12 +406,7 @@ export async function submitLiveCodingExplanation(input: {
   // Step 3: Combine scores — 60% code, 40% explanation
   const codeScore    = existing.codeScore || 0
   const explainScore = evaluation.score
-  let finalScore     = (codeScore * 0.6) + (explainScore * 0.4)
-
-  // FIX: Cap at 6.5 if copy-paste detected (as per Scoring & Reports infographic)
-  if (evaluation.copiedCodeSignal) {
-    finalScore = Math.min(finalScore, 6.5)
-  }
+  const finalScore   = (codeScore * 0.6) + (explainScore * 0.4)
 
   // Update the answer record
   await prisma.interviewAnswer.update({
@@ -524,39 +455,16 @@ export async function completeAttempt(attemptId: string, candidateId: string) {
   })
   const cfg = (roundCfg?.roundConfig as any) || {}
 
-  // Fetch assigned questions to know the exact max score (based on what should have been answered)
-  const assigned = await prisma.question.findMany({
-    where:  { id: { in: attempt.assignedQuestionIds as string[] } },
-    select: { id: true, type: true, marksAwarded: true },
-  })
-
-  // Group MCQs by questionId to avoid double counting (though upsert handles most cases)
-  const mcqMap = new Map<string, number>()
-  attempt.mcqAnswers.forEach(a => mcqMap.set(a.questionId, a.marksAwarded || 0))
-  const mcqTotal = Array.from(mcqMap.values()).reduce((s, m) => s + m, 0)
-  const mcqAssigned = assigned.filter(q => q.type === 'MCQ')
-  const mcqMax = mcqAssigned.reduce((s, q) => s + (q.marksAwarded || cfg.marksPerQuestion || 1), 0)
-
-  // Group Coding by questionId — take MAX marks per question
-  const codingMap = new Map<string, number>()
-  attempt.codingSubmissions.forEach(s => {
-    const cur = codingMap.get(s.questionId) || 0
-    codingMap.set(s.questionId, Math.max(cur, s.marksAwarded || 0))
-  })
-  const codingTotal = Array.from(codingMap.values()).reduce((s, m) => s + m, 0)
-  const codingAssigned = assigned.filter(q => q.type === 'CODING')
-  const codingMax = codingAssigned.length * 10
-
-  // Group Interview by questionId
-  const intMap = new Map<string, number>()
-  attempt.interviewAnswers.forEach(a => intMap.set(a.questionId, Math.max(intMap.get(a.questionId) || 0, (a.aiScore || 0) / 10)))
-  const interviewTotal = Array.from(intMap.values()).reduce((s, m) => s + m, 0)
-  const intAssigned = assigned.filter(q => q.type === 'INTERVIEW_PROMPT')
-  const interviewMax = intAssigned.length
+  const mcqTotal       = attempt.mcqAnswers.reduce((s, a) => s + (a.marksAwarded || 0), 0)
+  const mcqMax         = attempt.mcqAnswers.length * (cfg.marksPerQuestion || 1)
+  const codingTotal    = attempt.codingSubmissions.reduce((s, s2) => s + (s2.marksAwarded || 0), 0)
+  const codingMax      = attempt.codingSubmissions.length * 10
+  const interviewTotal = attempt.interviewAnswers.reduce((s, a) => s + ((a.aiScore || 0) / 10), 0)
+  const interviewMax   = attempt.interviewAnswers.length
 
   const rawScore = mcqTotal + codingTotal + interviewTotal
   const maxScore = Math.max(1, mcqMax + codingMax + interviewMax)
-  const pctScore = Math.min(100, (rawScore / maxScore) * 100)
+  const pctScore = (rawScore / maxScore) * 100
   const passMark = roundCfg?.passMarkPercent ?? 60
   const passed   = calculatePassFail(rawScore, maxScore, passMark)
 

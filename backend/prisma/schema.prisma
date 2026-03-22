@@ -402,7 +402,7 @@ model Question {
   explanationPrompt    String?   // "Explain your solution..." follow-up
   explanationRubric    String?   // What a good explanation covers
 
-  isActive        Boolean      @default(true) // false = admin rejected
+  isActive        Boolean      @default(false) // false = pending/rejected, true = approved
   createdAt       DateTime     @default(now())
 
   // Answers referencing this question
@@ -546,6 +546,16 @@ model InterviewAnswer {
 
   timeTakenSeconds Int?
   answeredAt      DateTime         @default(now())
+
+  // ── Delivery / Communication metrics (AUDIO mode) ─────────
+  durationSeconds   Float?
+  speechDuration    Float?
+  silenceRatio      Float?
+  wordsPerMinute    Float?
+  wordCount         Int?
+  fillerWordCount   Int?
+  fillerWordRatio   Float?
+  deliveryScore     Float?
 
   @@index([attemptId])
 }

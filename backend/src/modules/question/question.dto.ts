@@ -9,5 +9,11 @@ export const ApproveQuestionDto = z.object({
   approved:   z.boolean(),
 })
 
+export const BulkApproveDto = z.object({
+  poolId:  z.string().uuid(),
+  approve: z.boolean(), // true = approve all, false = reject all
+})
+
 export type GeneratePoolInput    = z.infer<typeof GeneratePoolDto>
 export type ApproveQuestionInput = z.infer<typeof ApproveQuestionDto>
+export type BulkApproveInput     = z.infer<typeof BulkApproveDto>
