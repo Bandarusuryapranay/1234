@@ -43,11 +43,9 @@ export default function RoundDispatcher() {
     )
   }
 
-  // Route to correct round component
   if (round.roundType === 'MCQ')      return <MCQRound />
   if (round.roundType === 'CODING')   return <CodingRound />
   if (round.roundType === 'MIXED')    return <MixedRound />
-
   if (round.roundType === 'INTERVIEW') {
     if (round.interviewMode === 'LIVE_CODING') return <LiveCodingRound />
     return <InterviewRound />

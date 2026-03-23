@@ -72,7 +72,7 @@ export async function startAttempt(candidateId: string, input: StartAttemptInput
           prisma.question.create({
             data: {
               poolId:           round.questionPool!.id,
-              type: 'INTERVIEW_PROMPT',
+              type:             'INTERVIEW_PROMPT',
               difficulty:       q.difficulty || 'MEDIUM',
               topicTag:         q.topicTag,
               order:            999, // high order = candidate-personalised
@@ -156,7 +156,16 @@ export async function startAttempt(candidateId: string, input: StartAttemptInput
     interviewMode:    roundConfig.interviewMode,
   }))
 
-  return { attempt, questions: safeQuestions, interviewMode: roundConfig.interviewMode }
+  // Create session for proctoring
+  const session = await prisma.session.create({ data: { candidateId } })
+
+  return {
+    attempt,
+    questions:      safeQuestions,
+    interviewMode:  roundConfig.interviewMode,
+    sessionId:      session.id,                          // ← ProctoringCamera needs this
+    faceDescriptor: (candidate as any).faceDescriptor,  // ← identity verification
+  }
 }
 
 // ── Time enforcement ──────────────────────────────────────────

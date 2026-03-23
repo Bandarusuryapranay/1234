@@ -13,7 +13,7 @@ export async function generateScorecard(candidateId: string) {
           mcqAnswers:        true,
           codingSubmissions: true,
           interviewAnswers:  {
-            include: { question: { select: { prompt: true, topicTag: true } } }
+            include: { question: { select: { prompt: true, topicTag: true } } },
           },
         },
         orderBy: { completedAt: 'asc' },
@@ -22,7 +22,7 @@ export async function generateScorecard(candidateId: string) {
     },
   })
 
-  // Build round scores — recalculate to fix any potentially corrupted old data (e.g. percentages > 100)
+  // Build round scores
   const roundScores = await Promise.all(candidate.attempts.map(async (attempt) => {
     const assigned = await prisma.question.findMany({
       where:  { id: { in: attempt.assignedQuestionIds as string[] } },
@@ -31,39 +31,46 @@ export async function generateScorecard(candidateId: string) {
 
     const mcqMap = new Map<string, number>()
     attempt.mcqAnswers.forEach(a => mcqMap.set(a.questionId, a.marksAwarded || 0))
-    const mcqTotal = Array.from(mcqMap.values()).reduce((s, m) => s + m, 0)
-    const mcqAssigned = assigned.filter(q => q.type === 'MCQ')
-    const mcqMax = mcqAssigned.reduce((s, q) => s + (q.marksAwarded || 1), 0)
+    const mcqTotal    = Array.from(mcqMap.values()).reduce((s, m) => s + m, 0)
+    const mcqMax      = assigned.filter(q => q.type === 'MCQ').reduce((s, q) => s + (q.marksAwarded || 1), 0)
 
     const codingMap = new Map<string, number>()
     attempt.codingSubmissions.forEach(s => {
-      const cur = codingMap.get(s.questionId) || 0
-      codingMap.set(s.questionId, Math.max(cur, s.marksAwarded || 0))
+      codingMap.set(s.questionId, Math.max(codingMap.get(s.questionId) || 0, s.marksAwarded || 0))
     })
     const codingTotal = Array.from(codingMap.values()).reduce((s, m) => s + m, 0)
-    const codingMax = assigned.filter(q => q.type === 'CODING').length * 10
+    const codingMax   = assigned.filter(q => q.type === 'CODING').length * 10
 
     const intMap = new Map<string, number>()
-    attempt.interviewAnswers.forEach(a => intMap.set(a.questionId, Math.max(intMap.get(a.questionId) || 0, (a.aiScore || 0) / 10)))
+    attempt.interviewAnswers.forEach(a =>
+      intMap.set(a.questionId, Math.max(intMap.get(a.questionId) || 0, (a.aiScore || 0) / 10))
+    )
     const interviewTotal = Array.from(intMap.values()).reduce((s, m) => s + m, 0)
-    const interviewMax = assigned.filter(q => q.type === 'INTERVIEW_PROMPT').length
+    const interviewMax   = assigned.filter(q => q.type === 'INTERVIEW_PROMPT').length
 
     const rawScore = mcqTotal + codingTotal + interviewTotal
     const maxScore = Math.max(1, mcqMax + codingMax + interviewMax)
     const pctScore = Math.min(100, (rawScore / maxScore) * 100)
 
-    // Also fetch the pass mark to ensure 'passed' is accurate after recalculation
-    const round = await prisma.pipelineRound.findUnique({ where: { id: attempt.roundId }, select: { passMarkPercent: true } })
+    const round = await prisma.pipelineRound.findUnique({
+      where:  { id: attempt.roundId },
+      select: { passMarkPercent: true, roundType: true, order: true },
+    })
     const passMark = round?.passMarkPercent ?? 60
 
     return {
-      roundId:      attempt.roundId,
-      percentScore: pctScore,
-      passed:       pctScore >= passMark,
+      roundId:         attempt.roundId,
+      roundType:       round?.roundType || 'UNKNOWN',
+      roundOrder:      round?.order     || 0,
+      passMarkPercent: passMark,
+      percentScore:    pctScore,
+      passed:          pctScore >= passMark,
+      startedAt:       attempt.startedAt,
+      completedAt:     attempt.completedAt,
     }
   }))
 
-  // Build interview answers for gap analysis — deduplicate by questionId (taking latest)
+  // Build interview answers for gap analysis
   const iaMap = new Map<string, any>()
   candidate.attempts.forEach(a => {
     a.interviewAnswers.forEach(ia => {
@@ -81,8 +88,7 @@ export async function generateScorecard(candidateId: string) {
     })
   })
   const interviewAnswers = Array.from(iaMap.values())
-
-  const totalStrikes = candidate.strikeLog.filter(s => s.isStrike).length
+  const totalStrikes     = candidate.strikeLog.filter(s => s.isStrike).length
 
   const result = await runGapAnalysis({
     jobDescription:   candidate.campaign.jobDescription,
@@ -94,7 +100,7 @@ export async function generateScorecard(candidateId: string) {
     interviewAnswers,
   })
 
-  // Upsert scorecard
+  // Upsert scorecard — campaignId required on create
   return prisma.scoreCard.upsert({
     where:  { candidateId },
     update: {
@@ -124,12 +130,18 @@ export async function getScorecard(candidateId: string) {
         include: {
           user:      { select: { firstName: true, lastName: true, email: true } },
           strikeLog: { orderBy: { occurredAt: 'asc' } },
+          campaign:  { select: { name: true, role: true } },
           attempts:  {
             include: {
+              round: {
+                select: { roundType: true, passMarkPercent: true, order: true },
+              },
               interviewAnswers: {
                 include: { question: { select: { prompt: true, topicTag: true } } },
+                orderBy: { answeredAt: 'asc' },
               },
             },
+            orderBy: { startedAt: 'asc' },
           },
         },
       },

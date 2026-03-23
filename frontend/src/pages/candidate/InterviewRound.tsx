@@ -104,7 +104,7 @@ export default function InterviewRound() {
   }
 
   const handleReplay = () => {
-    if (isRecording) stopRecording()
+    if (isRecording) stopRecording() // fire and forget — we reset blob anyway
     setAudioBlob(null); clearTimers(); setIsSpeaking(true)
     const q = questions[currentIndex]
     speakText(q.prompt, () => {
@@ -137,19 +137,38 @@ export default function InterviewRound() {
         setAudioDuration(d => { if (d + 1 >= WARN_RECORD_SECONDS) setShowTimeWarn(true); return d + 1 })
       }, 1000)
       autoStopRef.current = setTimeout(() => {
-        toast('Max recording time reached — stopping.', { icon: '⏱' }); stopRecording()
+        toast('Max recording time reached — stopping.', { icon: '⏱' })
+        stopRecording() // fire and forget — autoStop just stops, doesn't navigate
       }, MAX_RECORD_SECONDS * 1000)
     } catch {
       toast.error('Microphone access denied. Please allow mic access.')
     }
   }
 
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current?.state === 'recording') mediaRecorderRef.current.stop()
-    streamRef.current?.getTracks().forEach(t => t.stop())
-    if (durationTimerRef.current) clearInterval(durationTimerRef.current)
-    if (autoStopRef.current) clearTimeout(autoStopRef.current)
-    setIsRecording(false); setShowTimeWarn(false)
+  // stopRecording — returns a Promise that resolves with the blob once onstop fires
+  const stopRecording = useCallback((): Promise<Blob | null> => {
+    return new Promise((resolve) => {
+      if (durationTimerRef.current) clearInterval(durationTimerRef.current)
+      if (autoStopRef.current)      clearTimeout(autoStopRef.current)
+      setIsRecording(false); setShowTimeWarn(false)
+
+      const recorder = mediaRecorderRef.current
+      if (!recorder || recorder.state === 'inactive') {
+        streamRef.current?.getTracks().forEach(t => t.stop())
+        resolve(null)
+        return
+      }
+
+      // Override onstop to resolve the promise AND set state
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
+        streamRef.current?.getTracks().forEach(t => t.stop())
+        setAudioBlob(blob)
+        resolve(blob)
+      }
+
+      recorder.stop()
+    })
   }, [])
 
   const formatDuration = (secs: number) => {
@@ -198,8 +217,7 @@ export default function InterviewRound() {
       if (answers[qId].trim().split(/\s+/).length < 10) { toast.error('Min 10 words required.'); return }
     }
     if (interviewMode === 'AUDIO') {
-      if (isRecording) stopRecording()
-      if (!audioBlob) { toast.error('Please record your answer.'); return }
+      if (!audioBlob && !isRecording) { toast.error('Please record your answer first.'); return }
     }
 
     stopSpeaking(); setSubmitting(true)
@@ -208,13 +226,36 @@ export default function InterviewRound() {
       if (interviewMode === 'TEXT') {
         await attemptApi.submitInterview({ attemptId: attempt.id, questionId: qId, mode: 'TEXT', textAnswer: answers[qId], timeTakenSeconds: 0 })
       } else {
+        // Capture blob BEFORE any state changes happen
+        // If still recording → stop and wait for onstop to fire and return blob
+        // If already stopped → use the ref directly (chunksRef has the data even if state reset)
+        let blobToSend: Blob | null = null
+
+        if (isRecording) {
+          blobToSend = await stopRecording()
+        } else if (audioBlob) {
+          blobToSend = audioBlob
+        } else if (chunksRef.current.length > 0) {
+          // Fallback: blob state may have been reset but chunks are still in ref
+          blobToSend = new Blob(chunksRef.current, { type: 'audio/webm' })
+        }
+
+        if (!blobToSend || blobToSend.size === 0) {
+          toast.error('Recording not captured. Please re-record your answer.')
+          setSubmitting(false)
+          return
+        }
+
+        // Snapshot duration before state resets on question change
+        const snapshotDuration = audioDuration
+
         const fd = new FormData()
         fd.append('attemptId', attempt.id)
         fd.append('questionId', qId)
         fd.append('mode', 'AUDIO')
-        fd.append('timeTakenSeconds', String(audioDuration))
-        fd.append('durationSeconds', String(audioDuration))
-        fd.append('audio', audioBlob!, `answer-${qId}.webm`)
+        fd.append('timeTakenSeconds', String(snapshotDuration))
+        fd.append('durationSeconds',  String(snapshotDuration))
+        fd.append('audio', blobToSend, `answer-${qId}.webm`)
         await attemptApi.submitInterviewAudio(fd)
       }
 
@@ -255,7 +296,7 @@ export default function InterviewRound() {
   const isLast    = currentIndex === questions.length - 1
   const canSubmit = interviewMode === 'TEXT'
     ? (answers[q.id] || '').trim().split(/\s+/).length >= 10
-    : !!audioBlob && !isRecording
+    : !!audioBlob || isRecording  // allow submit while recording — we stop it in handleNext
   const isNearLimit = audioDuration >= WARN_RECORD_SECONDS
 
   return (
