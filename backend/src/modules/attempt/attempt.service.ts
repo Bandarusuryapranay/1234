@@ -252,12 +252,13 @@ async function runTestCasesWithRetry(submissionId: string, input: SubmitCodingIn
 // ── Submit Interview (TEXT / AUDIO) ───────────────────────────
 export async function submitInterviewAnswer(
   input: SubmitInterviewInput,
-  audioBuffer?: Buffer,  // optional raw audio from multipart upload
+  audioBuffer?: Buffer,
 ) {
   await enforceTimeLimit(input.attemptId)
 
   const question = await prisma.question.findUniqueOrThrow({
     where:  { id: input.questionId },
+    // ADDED: followUpPrompts to the select
     select: { prompt: true, evaluationRubric: true, topicTag: true, followUpPrompts: true },
   })
 
@@ -266,7 +267,7 @@ export async function submitInterviewAnswer(
     include: { candidate: { include: { campaign: { select: { role: true } } } } },
   })
 
-  // Transcribe audio if AUDIO mode and buffer provided
+  // ... (Keep your existing transcription logic here) ...
   let sttTranscript = input.sttTranscript || ''
   if (audioBuffer && audioBuffer.length > 0 && !sttTranscript) {
     try {
@@ -276,14 +277,13 @@ export async function submitInterviewAnswer(
       console.warn('[InterviewAnswer] Whisper transcription failed:', err)
     }
   }
-
   const answerText = input.textAnswer || sttTranscript || ''
 
-  // Extract category from topicTag
   const topicTag = question.topicTag || ''
   const category = topicTag.startsWith('resume:') ? 'RESUME_DRILL'
     : (question.followUpPrompts as any[])?.[0]?.category || undefined
 
+  // ADDED: Pass configuredFollowUps to the evaluator
   const evaluation = await evaluateInterviewAnswer({
     prompt:    question.prompt!,
     answer:    answerText,
@@ -291,17 +291,17 @@ export async function submitInterviewAnswer(
     role:      attempt.candidate.campaign.role,
     category,
     topicTag,
+    configuredFollowUps: question.followUpPrompts as any[], 
   })
 
-  // Combine content score (AI) + delivery score (frontend computed)
-  // Content = 75% weight, Delivery = 25% weight for AUDIO mode
+  // ... (Keep your existing score calculation here) ...
   const contentScore  = evaluation.score
   const deliveryScore = input.deliveryScore ?? null
   const finalScore    = deliveryScore !== null
     ? (contentScore * 0.75) + (deliveryScore * 0.25)
     : contentScore
 
-  return prisma.interviewAnswer.create({
+  const savedAnswer = await prisma.interviewAnswer.create({
     data: {
       attemptId:        input.attemptId,
       questionId:       input.questionId,
@@ -315,7 +315,6 @@ export async function submitInterviewAnswer(
         : evaluation.reasoning,
       aiFollowUpAsked:  evaluation.followUp,
       timeTakenSeconds: input.timeTakenSeconds,
-      // Delivery metrics
       durationSeconds:  input.durationSeconds,
       speechDuration:   input.speechDuration,
       silenceRatio:     input.silenceRatio,
@@ -326,6 +325,12 @@ export async function submitInterviewAnswer(
       deliveryScore:    deliveryScore,
     },
   })
+
+  // ADDED: Return followUp to the frontend response
+  return { 
+    ...savedAnswer, 
+    followUp: evaluation.followUp || null 
+  }
 }
 
 // ── Submit LIVE_CODING — Phase 1: submit code ─────────────────
@@ -380,18 +385,18 @@ export async function submitLiveCodingExplanation(input: {
   attemptId:   string
   answerId:    string
   questionId:  string
-  audioBuffer: Buffer  // raw audio from MediaRecorder
+  audioBuffer: Buffer 
 }) {
   await enforceTimeLimit(input.attemptId)
 
-  // Get the existing answer with code
   const existing = await prisma.interviewAnswer.findUniqueOrThrow({
     where: { id: input.answerId },
   })
 
   const question = await prisma.question.findUniqueOrThrow({
     where:  { id: input.questionId },
-    select: { liveCodingProblem: true, explanationRubric: true },
+    // ADDED: followUpPrompts to the select
+    select: { liveCodingProblem: true, explanationRubric: true, followUpPrompts: true },
   })
 
   const attempt = await prisma.candidateAttempt.findUniqueOrThrow({
@@ -399,10 +404,9 @@ export async function submitLiveCodingExplanation(input: {
     include: { candidate: { include: { campaign: { select: { role: true } } } } },
   })
 
-  // Step 1: Transcribe audio via Groq Whisper
   const { text: transcript } = await transcribeAudio(input.audioBuffer)
 
-  // Step 2: AI evaluates explanation against actual code
+  // ADDED: Pass configuredFollowUps to the evaluator
   const evaluation = await evaluateCodeExplanation({
     problem:    question.liveCodingProblem || '',
     code:       existing.codeSubmission || '',
@@ -410,15 +414,14 @@ export async function submitLiveCodingExplanation(input: {
     transcript,
     rubric:     question.explanationRubric || '',
     role:       attempt.candidate.campaign.role,
+    configuredFollowUps: question.followUpPrompts as any[],
   })
 
-  // Step 3: Combine scores — 60% code, 40% explanation
   const codeScore    = existing.codeScore || 0
   const explainScore = evaluation.score
   const finalScore   = (codeScore * 0.6) + (explainScore * 0.4)
 
-  // Update the answer record
-  await prisma.interviewAnswer.update({
+  const updatedAnswer = await prisma.interviewAnswer.update({
     where: { id: input.answerId },
     data: {
       explainTranscript: transcript,
@@ -429,12 +432,15 @@ export async function submitLiveCodingExplanation(input: {
     },
   })
 
+  // ADDED: Return followUp to the frontend response
   return {
+    ...updatedAnswer,
     codeScore,
     explainScore,
     finalScore,
+    followUp: evaluation.followUp || null,
     copiedCodeSignal: evaluation.copiedCodeSignal,
-    reasoning:        evaluation.reasoning,
+    reasoning:         evaluation.reasoning,
     transcript,
   }
 }

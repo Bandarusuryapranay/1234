@@ -6,8 +6,6 @@ import toast from 'react-hot-toast'
 
 const MAX_RECORD_SECONDS  = 180
 const WARN_RECORD_SECONDS = 150
-const MIN_ANSWER_SECONDS  = 15
-const FILLER_WORDS = ['um','uh','like','you know','basically','literally','actually','so','right','okay','er','hmm']
 
 function speakText(text: string, onEnd?: () => void) {
   if (!window.speechSynthesis) { onEnd?.(); return }
@@ -39,9 +37,10 @@ export default function InterviewRound() {
   const [audioBlob, setAudioBlob]         = useState<Blob | null>(null)
   const [audioDuration, setAudioDuration] = useState(0)
   const [showTimeWarn, setShowTimeWarn]   = useState(false)
+  const [activeFollowUp, setActiveFollowUp] = useState<string | null>(null)
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const chunksRef        = useRef<Blob[]>([])
+  const chunksRef         = useRef<Blob[]>([])
   const durationTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const autoStopRef      = useRef<ReturnType<typeof setTimeout> | null>(null)
   const ttsTimerRef      = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -52,11 +51,12 @@ export default function InterviewRound() {
     return () => { stopSpeaking(); stopRecording(); clearTimers() }
   }, [roundId])
 
-  // Auto-dictate + auto-start recording when question changes
   useEffect(() => {
     if (loading || questions.length === 0) return
     const q = questions[currentIndex]
-    if (!q?.prompt) return
+    const textToPrompt = activeFollowUp || q?.prompt
+    if (!textToPrompt) return
+
     clearTimers()
     setAudioBlob(null); setAudioDuration(0); setShowTimeWarn(false); setIsSpeaking(true)
 
@@ -66,17 +66,8 @@ export default function InterviewRound() {
         ttsTimerRef.current = setTimeout(() => startRecording(), 800)
       }
     }
-
-    speakText(q.prompt, onTTSEnd)
-
-    // Fallback: force-start if onend doesn't fire
-    if (interviewMode === 'AUDIO') {
-      const fallbackMs = (q.prompt.length / 12) * 1000 + 4000
-      ttsTimerRef.current = setTimeout(() => {
-        stopSpeaking(); setIsSpeaking(false); startRecording()
-      }, fallbackMs)
-    }
-  }, [currentIndex, loading, questions, interviewMode])
+    speakText(textToPrompt, onTTSEnd)
+  }, [currentIndex, loading, questions, interviewMode, activeFollowUp])
 
   function clearTimers() {
     if (ttsTimerRef.current)   clearTimeout(ttsTimerRef.current)
@@ -89,8 +80,8 @@ export default function InterviewRound() {
       setLoading(true)
       const data = await attemptApi.start(roundId!)
       setAttempt(data.attempt)
-      if (setAttemptId)      setAttemptId(data.attempt.id)
-      if (setSessionId)      setSessionId(data.sessionId)
+      if (setAttemptId) setAttemptId(data.attempt.id)
+      if (setSessionId) setSessionId(data.sessionId)
       if (setFaceDescriptor) setFaceDescriptor(data.faceDescriptor)
       setQuestions(data.questions)
       setRoundTitle('AI Interview')
@@ -98,24 +89,9 @@ export default function InterviewRound() {
       setStrikes(data.attempt.strikeCount)
       setInterviewMode(data.interviewMode || 'TEXT')
     } catch (err: any) {
-      toast.error(err.response?.data?.message || 'Failed to start attempt')
+      toast.error('Failed to start attempt')
       navigate('/candidate/lobby')
     } finally { setLoading(false) }
-  }
-
-  const handleReplay = () => {
-    if (isRecording) stopRecording() // fire and forget — we reset blob anyway
-    setAudioBlob(null); clearTimers(); setIsSpeaking(true)
-    const q = questions[currentIndex]
-    speakText(q.prompt, () => {
-      setIsSpeaking(false)
-      if (interviewMode === 'AUDIO') ttsTimerRef.current = setTimeout(() => startRecording(), 800)
-    })
-  }
-
-  const handleStopTTS = () => {
-    clearTimers(); stopSpeaking(); setIsSpeaking(false)
-    if (interviewMode === 'AUDIO') ttsTimerRef.current = setTimeout(() => startRecording(), 400)
   }
 
   const startRecording = async () => {
@@ -133,292 +109,156 @@ export default function InterviewRound() {
       }
       recorder.start(250)
       setIsRecording(true); setAudioDuration(0); setShowTimeWarn(false)
+      
       durationTimerRef.current = setInterval(() => {
-        setAudioDuration(d => { if (d + 1 >= WARN_RECORD_SECONDS) setShowTimeWarn(true); return d + 1 })
+        setAudioDuration(d => {
+          const next = d + 1
+          if (next >= MAX_RECORD_SECONDS) {
+            stopRecording()
+            toast.error("Maximum recording time reached")
+          }
+          if (next >= WARN_RECORD_SECONDS) setShowTimeWarn(true)
+          return next
+        })
       }, 1000)
-      autoStopRef.current = setTimeout(() => {
-        toast('Max recording time reached — stopping.', { icon: '⏱' })
-        stopRecording() // fire and forget — autoStop just stops, doesn't navigate
-      }, MAX_RECORD_SECONDS * 1000)
-    } catch {
-      toast.error('Microphone access denied. Please allow mic access.')
-    }
+    } catch { toast.error('Microphone access denied.') }
   }
 
-  // stopRecording — returns a Promise that resolves with the blob once onstop fires
   const stopRecording = useCallback((): Promise<Blob | null> => {
     return new Promise((resolve) => {
-      if (durationTimerRef.current) clearInterval(durationTimerRef.current)
-      if (autoStopRef.current)      clearTimeout(autoStopRef.current)
+      clearTimers()
       setIsRecording(false); setShowTimeWarn(false)
-
       const recorder = mediaRecorderRef.current
       if (!recorder || recorder.state === 'inactive') {
         streamRef.current?.getTracks().forEach(t => t.stop())
-        resolve(null)
-        return
+        resolve(null); return
       }
-
-      // Override onstop to resolve the promise AND set state
       recorder.onstop = () => {
         const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
         streamRef.current?.getTracks().forEach(t => t.stop())
-        setAudioBlob(blob)
-        resolve(blob)
+        setAudioBlob(blob); resolve(blob)
       }
-
       recorder.stop()
     })
   }, [])
 
-  const formatDuration = (secs: number) => {
-    const m = Math.floor(secs / 60).toString().padStart(2, '0')
-    const s = (secs % 60).toString().padStart(2, '0')
-    return `${m}:${s}`
-  }
-
-  // Compute delivery metrics from transcript + duration
-  function computeDeliveryMetrics(transcript: string, durationSecs: number) {
-    const words          = transcript.trim().split(/\s+/).filter(Boolean)
-    const wordCount      = words.length
-    const fillerWordCount = words.filter(w => FILLER_WORDS.includes(w.toLowerCase().replace(/[^a-z]/g, ''))).length
-    const fillerWordRatio = wordCount > 0 ? fillerWordCount / wordCount : 0
-    const speechDuration  = Math.min(wordCount * 0.4, durationSecs)
-    const silenceRatio    = durationSecs > 0 ? Math.max(0, 1 - speechDuration / durationSecs) : 0
-    const wordsPerMinute  = speechDuration > 0 ? (wordCount / speechDuration) * 60 : 0
-
-    let score = 10
-    if (wordsPerMinute < 60)   score -= 2.5
-    else if (wordsPerMinute < 100) score -= 1
-    else if (wordsPerMinute > 200) score -= 2
-    else if (wordsPerMinute > 180) score -= 1
-    if (silenceRatio > 0.6)    score -= 2.5
-    else if (silenceRatio > 0.4) score -= 1
-    if (fillerWordRatio > 0.15) score -= 2
-    else if (fillerWordRatio > 0.08) score -= 1
-    if (durationSecs < MIN_ANSWER_SECONDS) score -= 3
-
-    return {
-      durationSeconds: durationSecs,
-      speechDuration,
-      silenceRatio,
-      wordsPerMinute,
-      wordCount,
-      fillerWordCount,
-      fillerWordRatio,
-      deliveryScore: Math.max(0, Math.min(10, score)),
-    }
-  }
-
   const handleNext = async () => {
     const qId = questions[currentIndex].id
-    if (interviewMode === 'TEXT') {
-      if (!answers[qId]?.trim()) { toast.error('Please type your answer.'); return }
-      if (answers[qId].trim().split(/\s+/).length < 10) { toast.error('Min 10 words required.'); return }
-    }
-    if (interviewMode === 'AUDIO') {
-      if (!audioBlob && !isRecording) { toast.error('Please record your answer first.'); return }
-    }
-
     stopSpeaking(); setSubmitting(true)
 
     try {
+      let res;
       if (interviewMode === 'TEXT') {
-        await attemptApi.submitInterview({ attemptId: attempt.id, questionId: qId, mode: 'TEXT', textAnswer: answers[qId], timeTakenSeconds: 0 })
+        res = await attemptApi.submitInterview({ 
+          attemptId: attempt.id, 
+          questionId: qId, 
+          mode: 'TEXT', 
+          textAnswer: answers[qId] || "",
+          timeTakenSeconds: 0 
+        })
       } else {
-        // Capture blob BEFORE any state changes happen
-        // If still recording → stop and wait for onstop to fire and return blob
-        // If already stopped → use the ref directly (chunksRef has the data even if state reset)
-        let blobToSend: Blob | null = null
-
-        if (isRecording) {
-          blobToSend = await stopRecording()
-        } else if (audioBlob) {
-          blobToSend = audioBlob
-        } else if (chunksRef.current.length > 0) {
-          // Fallback: blob state may have been reset but chunks are still in ref
-          blobToSend = new Blob(chunksRef.current, { type: 'audio/webm' })
-        }
-
-        if (!blobToSend || blobToSend.size === 0) {
-          toast.error('Recording not captured. Please re-record your answer.')
-          setSubmitting(false)
-          return
-        }
-
-        // Snapshot duration before state resets on question change
-        const snapshotDuration = audioDuration
-
+        let blobToSend = isRecording ? await stopRecording() : audioBlob
+        if (!blobToSend) throw new Error("No audio captured")
         const fd = new FormData()
         fd.append('attemptId', attempt.id)
         fd.append('questionId', qId)
         fd.append('mode', 'AUDIO')
-        fd.append('timeTakenSeconds', String(snapshotDuration))
-        fd.append('durationSeconds',  String(snapshotDuration))
         fd.append('audio', blobToSend, `answer-${qId}.webm`)
-        await attemptApi.submitInterviewAudio(fd)
+        fd.append('timeTakenSeconds', String(audioDuration))
+        res = await attemptApi.submitInterviewAudio(fd)
       }
 
+      if (res.followUp && !activeFollowUp) {
+        toast("Follow-up question coming up...", { icon: '💬' })
+        setActiveFollowUp(res.followUp)
+        setAnswers({ ...answers, [qId]: "" })
+        setAudioBlob(null)
+        setSubmitting(false)
+        return
+      }
+
+      setActiveFollowUp(null)
       if (currentIndex < questions.length - 1) {
         setCurrentIndex(currentIndex + 1)
       } else {
-        await handleFinish()
+        const finishRes = await attemptApi.complete(attempt.id)
+        navigate('/candidate/lobby', { state: { advancement: finishRes.advancement } })
       }
     } catch (err: any) {
-      toast.error(err.response?.data?.message || 'Failed to submit. Try again.')
+      toast.error('Submission failed.')
     } finally { setSubmitting(false) }
   }
 
-  const handleFinish = async () => {
-    try {
-      const res = await attemptApi.complete(attempt.id)
-      const outcome = res.advancement?.outcome
-      if (outcome === 'ADVANCED')           navigate('/candidate/lobby',      { state: { advancement: res.advancement } })
-      else if (outcome === 'ALL_ROUNDS_COMPLETE') navigate('/candidate/complete')
-      else if (outcome === 'REJECTED')      navigate('/candidate/terminated', { state: { reason: res.advancement?.reason, type: 'failed' } })
-      else if (outcome === 'FLAGGED')       navigate('/candidate/complete',   { state: { pendingReview: true } })
-      else                                  navigate('/candidate/lobby')
-    } catch (err: any) { toast.error(err.response?.data?.message || 'Failed to finish.') }
-  }
-
-  if (loading) {
-    return (
-      <div style={{ display:'flex', alignItems:'center', justifyContent:'center', height:'60vh', gap:12 }}>
-        <div className="spinner" />
-        <span style={{ color:'var(--text-secondary)', fontSize:'0.875rem' }}>Preparing interview...</span>
-      </div>
-    )
-  }
-
   const q = questions[currentIndex]
-  if (!q) return <div style={{ padding:40, color:'var(--text-secondary)' }}>No questions available.</div>
-
-  const isLast    = currentIndex === questions.length - 1
-  const canSubmit = interviewMode === 'TEXT'
-    ? (answers[q.id] || '').trim().split(/\s+/).length >= 10
-    : !!audioBlob || isRecording  // allow submit while recording — we stop it in handleNext
-  const isNearLimit = audioDuration >= WARN_RECORD_SECONDS
+  if (loading || !q) return <div className="p-10 text-center">Loading...</div>
 
   return (
     <div style={{ maxWidth:680, margin:'0 auto', padding:'32px 20px', width:'100%', display:'flex', flexDirection:'column', gap:24 }}>
-
-      {/* Header */}
       <div style={{ display:'flex', alignItems:'center', gap:16 }}>
-        <div style={{ width:56, height:56, borderRadius:'50%', flexShrink:0, background:'linear-gradient(135deg, var(--orange), var(--red))', display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 0 20px var(--orange-glow)' }}>
+        <div style={{ width:56, height:56, borderRadius:'50%', background:'linear-gradient(135deg, var(--orange), var(--red))', display:'flex', alignItems:'center', justifyContent:'center' }}>
           <MessageSquare size={26} color="white" />
         </div>
         <div>
-          <h2 style={{ color:'var(--text-primary)', fontSize:'1.3rem', marginBottom:2 }}>AI Interview</h2>
-          <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-            <span style={{ color:'var(--text-secondary)', fontSize:'0.85rem' }}>Question {currentIndex + 1} of {questions.length}</span>
-            <span className={`badge ${interviewMode === 'AUDIO' ? 'badge-teal' : 'badge-primary'}`} style={{ fontSize:'0.6rem' }}>{interviewMode} MODE</span>
-          </div>
+          <h2 style={{ color:'var(--text-primary)', fontSize:'1.3rem' }}>AI Interview</h2>
+          <span style={{ color:'var(--text-secondary)', fontSize:'0.85rem' }}>
+            Question {currentIndex + 1} of {questions.length} {activeFollowUp && "(Follow-up)"}
+          </span>
         </div>
       </div>
 
-      {/* Question card */}
-      <div className="card" style={{ background:'var(--bg-elevated)', padding:'28px 28px 22px', position:'relative', border:'1px solid var(--border)' }}>
-        <div style={{ position:'absolute', top:-10, left:20, background:'var(--orange)', color:'white', fontSize:'0.65rem', fontWeight:700, padding:'2px 10px', borderRadius:4 }}>AI INTERVIEWER</div>
-        <p style={{ color:'var(--text-primary)', fontSize:'1.15rem', lineHeight:1.65, fontWeight:500, marginBottom:18 }}>{q.prompt}</p>
-        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-          {isSpeaking ? (
-            <>
-              <button className="btn btn-sm btn-ghost" onClick={handleStopTTS} style={{ gap:6, fontSize:'0.8rem' }}>
-                <VolumeX size={14} /> Skip & Start Recording
-              </button>
-              <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-                <div className="pulse" style={{ width:7, height:7, borderRadius:'50%', background:'var(--orange)' }} />
-                <span style={{ fontSize:'0.78rem', color:'var(--orange)' }}>Reading question...</span>
-              </div>
-            </>
-          ) : (
-            <button className="btn btn-sm btn-ghost" onClick={handleReplay} style={{ gap:6, fontSize:'0.8rem' }}>
-              <Volume2 size={14} /> Replay Question
-            </button>
-          )}
+      <div className="card" style={{ background:'var(--bg-elevated)', padding:'28px', border:'1px solid var(--border)', position:'relative' }}>
+        <div style={{ position:'absolute', top:-10, left:20, background:'var(--orange)', color:'white', fontSize:'0.65rem', fontWeight:700, padding:'2px 10px', borderRadius:4 }}>
+          {activeFollowUp ? 'FOLLOW-UP' : 'AI INTERVIEWER'}
+        </div>
+        <p style={{ color:'var(--text-primary)', fontSize:'1.15rem', lineHeight:1.6 }}>
+          {activeFollowUp || q.prompt}
+        </p>
+        <div style={{ marginTop: 15, display: 'flex', gap: 10 }}>
+            {isSpeaking ? (
+                <button className="btn-link" onClick={() => { stopSpeaking(); setIsSpeaking(false); if(interviewMode==='AUDIO') startRecording(); }} style={{ fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: 5, color: 'var(--orange)', background: 'none', border: 'none', cursor: 'pointer' }}>
+                    <VolumeX size={14} /> Skip Reading
+                </button>
+            ) : (
+                <button className="btn-link" onClick={() => speakText(activeFollowUp || q.prompt)} style={{ fontSize: '0.8rem', display: 'flex', alignItems: 'center', gap: 5, color: 'var(--text-secondary)', background: 'none', border: 'none', cursor: 'pointer' }}>
+                    <Volume2 size={14} /> Replay
+                </button>
+            )}
         </div>
       </div>
 
-      {/* TEXT MODE */}
-      {interviewMode === 'TEXT' && (
-        <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
-          <textarea
-            value={answers[q.id] || ''}
-            onChange={(e) => setAnswers({ ...answers, [q.id]: e.target.value })}
-            placeholder="Type your answer here..."
-            className="form-textarea"
-            style={{ minHeight:180, fontSize:'1rem', lineHeight:1.65, background:'var(--bg-card)', color:'var(--text-primary)' }}
-          />
-          <div style={{ display:'flex', justifyContent:'space-between', fontSize:'0.78rem', color:'var(--text-muted)' }}>
-            <span>
-              {(answers[q.id] || '').trim().split(/\s+/).filter(Boolean).length} words{' '}
-              <span style={{ color: (answers[q.id] || '').trim().split(/\s+/).filter(Boolean).length < 10 ? 'var(--red)' : 'var(--green-dark)' }}>
-                {(answers[q.id] || '').trim().split(/\s+/).filter(Boolean).length < 10 ? '(min 10 words)' : '✓'}
-              </span>
-            </span>
-            <span>Be specific and detailed</span>
-          </div>
-        </div>
-      )}
-
-      {/* AUDIO MODE */}
-      {interviewMode === 'AUDIO' && (
-        <div style={{ background:'var(--bg-elevated)', borderRadius:14, border:`1px solid ${isRecording ? 'rgba(251,55,30,0.4)' : 'var(--border)'}`, padding:'28px 24px', display:'flex', flexDirection:'column', alignItems:'center', gap:18, textAlign:'center', transition:'border-color 0.3s' }}>
-
-          {isSpeaking && <p style={{ color:'var(--text-secondary)', fontSize:'0.9rem' }}>🔊 Listen carefully — recording starts automatically when the question finishes.</p>}
-
-          {isRecording && !showTimeWarn && <p style={{ color:'var(--red)', fontSize:'0.9rem', fontWeight:600 }}>🔴 Recording in progress — speak clearly and naturally.</p>}
-
-          {isRecording && showTimeWarn && (
-            <div style={{ background:'var(--orange-soft)', border:'1px solid var(--orange)', borderRadius:8, padding:'10px 16px', display:'flex', alignItems:'center', gap:8, color:'var(--orange)', fontSize:'0.85rem', fontWeight:600 }}>
-              <AlertTriangle size={16} />
-              {MAX_RECORD_SECONDS - audioDuration} seconds left — start wrapping up
-            </div>
-          )}
-
-          {audioBlob && !isRecording && (
-            <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:10 }}>
-              <p style={{ color:'var(--green-dark)', fontSize:'0.9rem' }}>✓ Answer recorded ({formatDuration(audioDuration)})</p>
-              <button className="btn btn-ghost btn-sm" onClick={handleReplay} style={{ fontSize:'0.8rem', gap:6 }}>↺ Re-record</button>
-            </div>
-          )}
-
-          {/* Recording UI */}
-          {isRecording && (
-            <>
-              <div style={{ position:'relative', width:80, height:80, display:'flex', alignItems:'center', justifyContent:'center' }}>
-                <div style={{ position:'absolute', inset:0, borderRadius:'50%', border:'3px solid var(--red)', opacity:0.4, animation:'pulse 1s ease infinite' }} />
-                <div style={{ width:60, height:60, borderRadius:'50%', background:'var(--red)', display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 0 20px var(--red-glow)' }}>
-                  <Square size={22} color="white" />
+      {interviewMode === 'TEXT' ? (
+        <textarea
+          value={answers[q.id] || ''}
+          onChange={(e) => setAnswers({ ...answers, [q.id]: e.target.value })}
+          className="form-textarea"
+          placeholder="Type your answer..."
+          style={{ minHeight:180, width: '100%', padding: '15px', borderRadius: '8px', border: '1px solid var(--border)', background: 'var(--bg-card)', color: 'var(--text-primary)' }}
+        />
+      ) : (
+        <div style={{ textAlign: 'center', padding: '40px', background: 'var(--bg-card)', borderRadius: '12px', border: '1px solid var(--border)', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 20 }}>
+            {isRecording ? (
+                <>
+                    <div style={{ color: 'var(--red)', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: 10, fontSize: '1.2rem' }}>
+                        <Square size={20} fill="var(--red)" /> {Math.floor(audioDuration / 60)}:{(audioDuration % 60).toString().padStart(2, '0')}
+                    </div>
+                    {showTimeWarn && <div style={{ color: 'var(--orange)', fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: 5 }}><AlertTriangle size={16}/> Wrapping up soon...</div>}
+                    <button onClick={() => stopRecording()} className="btn btn-outline" style={{ borderColor: 'var(--red)', color: 'var(--red)' }}>Stop Recording</button>
+                </>
+            ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    {audioBlob ? (
+                      <span style={{ color: 'var(--green)', fontWeight: 600 }}>✓ Answer Captured</span>
+                    ) : (
+                      <span style={{ color: 'var(--text-secondary)' }}>Microphone ready. Recording starts automatically.</span>
+                    )}
                 </div>
-              </div>
-              <span style={{ fontFamily:'JetBrains Mono, monospace', fontSize:'1.4rem', fontWeight:700, color: isNearLimit ? 'var(--orange)' : 'var(--red)' }}>
-                {formatDuration(audioDuration)}
-                <span style={{ fontSize:'0.7rem', fontWeight:400, color:'var(--text-muted)', marginLeft:8 }}>/ {formatDuration(MAX_RECORD_SECONDS)}</span>
-              </span>
-              <div style={{ display:'flex', alignItems:'center', gap:3, height:28 }}>
-                {Array.from({ length: 18 }).map((_, i) => (
-                  <div key={i} style={{ width:3, borderRadius:3, background: isNearLimit ? 'var(--orange)' : 'var(--red)', height:`${10 + Math.sin(i * 0.8) * 8}px`, animation:`pulse ${0.35 + i * 0.07}s ease infinite` }} />
-                ))}
-              </div>
-              <button className="btn btn-outline btn-sm" onClick={stopRecording} style={{ gap:6 }}>
-                <Square size={13} /> Stop Recording
-              </button>
-            </>
-          )}
+            )}
         </div>
       )}
 
-      {/* Navigation */}
-      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', borderTop:'1px solid var(--border)', paddingTop:20 }}>
-        <div style={{ fontSize:'0.8rem', color:'var(--text-muted)' }}>
-          {interviewMode === 'AUDIO' ? 'Recording starts automatically after the question is read' : 'Use specific examples from your experience'}
-        </div>
-        <button className="btn btn-primary" onClick={handleNext} disabled={submitting || !canSubmit || isSpeaking} style={{ minWidth:160, gap:8 }}>
-          {submitting
-            ? <><div className="spinner spinner-sm" /> Processing...</>
-            : isLast ? <><Send size={16} /> Finish Interview</> : <>Next Question <ChevronRight size={16} /></>
-          }
+      <div style={{ display:'flex', justifyContent:'flex-end', paddingTop:20 }}>
+        <button className="btn btn-primary" onClick={handleNext} disabled={submitting || isSpeaking} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 24px' }}>
+          {submitting ? 'Processing...' : (currentIndex === questions.length - 1 && !activeFollowUp ? <><Send size={18}/> Finish Interview</> : <><ChevronRight size={18}/> Next Question</>)}
         </button>
       </div>
     </div>

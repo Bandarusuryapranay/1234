@@ -87,64 +87,58 @@ export async function runGapAnalysis(input: {
 }
 
 // ── Interview Answer Evaluation — context-aware ───────────────
+
 export async function evaluateInterviewAnswer(params: {
   prompt: string
   answer: string
   rubric: string
   role: string
-  category?: string  // WARMUP | CORE_TECHNICAL | SCENARIO | BEHAVIOURAL | CURVEBALL | RESUME_DRILL
+  category?: string
   topicTag?: string
+  configuredFollowUps?: any[] // NEW: The triggers from your prompt
 }): Promise<{ score: number; reasoning: string; followUp?: string }> {
 
   const categoryContext = params.category
-    ? `Question category: ${params.category}. ${params.category === 'RESUME_DRILL'
-      ? 'This question is probing a specific claim on their resume — verify whether the answer demonstrates genuine hands-on experience or surface-level knowledge.'
-      : params.category === 'SCENARIO'
-        ? 'This is a production scenario question — evaluate whether they show real operational experience and sound judgment under pressure.'
-        : params.category === 'BEHAVIOURAL'
-          ? 'This is a STAR-method question — penalise vague generalities, reward specific examples with measurable outcomes.'
-          : params.category === 'CURVEBALL'
-            ? 'This is a curveball question — evaluate the quality of their THINKING PROCESS, not whether they got a specific answer.'
-            : ''
-    }`
-    : ''
+    ? `Question category: ${params.category}.`
+    : '';
 
-  const evalPrompt = `You are evaluating a ${params.role} candidate interview answer.
+  // NEW: Instruction block for the AI to handle your custom triggers
+  const followUpInstruction = params.configuredFollowUps && params.configuredFollowUps.length > 0
+    ? `CANDIDATE-SPECIFIC FOLLOW-UP RULES:
+       You MUST check the candidate's answer against these triggers:
+       ${JSON.stringify(params.configuredFollowUps, null, 2)}
+       If a trigger condition is met (e.g., they missed a specific technical detail), you MUST return the corresponding "prompt" in the "followUp" field.`
+    : `If the score is below 8, generate a brief, natural follow-up question to probe the weakness. Otherwise, return null.`;
+
+  const evalPrompt = `You are a world-class interviewer for a ${params.role} position.
 ${categoryContext}
 Topic: ${params.topicTag || 'General'}
 
-QUESTION ASKED:
-"${params.prompt}"
+ORIGINAL QUESTION: "${params.prompt}"
+EVALUATION RUBRIC: ${params.rubric}
+CANDIDATE ANSWER: "${params.answer}"
 
-EVALUATION RUBRIC (what a strong answer covers):
-${params.rubric}
+${followUpInstruction}
 
-CANDIDATE'S ANSWER:
-"${params.answer}"
-
-Evaluate strictly against the rubric. Do not give benefit of the doubt.
-- If they give buzzwords without explanation: score 3-4 max
-- If they describe theory without practical application: score 5-6 max
-- If their answer contradicts the rubric's red flags: score 1-3
-- Only 9-10 if they hit all MUST MENTION items AND show a green flag signal
-
-Respond ONLY with JSON:
+Respond ONLY with valid JSON:
 {
   "score": <0-10>,
-  "reasoning": "2-3 sentences — cite specific parts of their answer, reference the rubric",
-  "followUp": "specific follow-up question to probe a weakness, or null if score >= 8"
-}`
+  "reasoning": "2-3 sentences citing the rubric vs the answer",
+  "followUp": "The follow-up question text or null"
+}`;
 
   const res = await openai.chat.completions.create({
     model: MODEL,
     temperature: 0.2,
     messages: [{ role: 'user', content: evalPrompt }],
     response_format: { type: 'json_object' },
-  })
-  return JSON.parse(res.choices[0].message.content || '{"score":0,"reasoning":""}')
+  });
+
+  return JSON.parse(res.choices[0].message.content || '{"score":0,"reasoning":"","followUp":null}');
 }
 
 // ── LIVE_CODING Explanation Evaluation ────────────────────────
+// Update the parameters to include configuredFollowUps
 export async function evaluateCodeExplanation(params: {
   problem: string
   code: string
@@ -152,20 +146,30 @@ export async function evaluateCodeExplanation(params: {
   transcript: string
   rubric: string
   role: string
+  configuredFollowUps?: any[] // <-- ADD THIS LINE
 }): Promise<{
   score: number
   reasoning: string
   copiedCodeSignal: boolean
   followUp?: string
 }> {
-  const prompt = explanationEvalPrompt(params)
+  // Add instructions for the follow-up triggers
+  const followUpInstruction = params.configuredFollowUps && params.configuredFollowUps.length > 0
+    ? `CODE-SPECIFIC FOLLOW-UP RULES:
+       If the candidate's explanation matches these triggers, use the prompt provided:
+       ${JSON.stringify(params.configuredFollowUps, null, 2)}`
+    : `If the explanation is weak or doesn't match the code, generate a follow-up question.`;
+
+  const prompt = explanationEvalPrompt(params) + `\n\n${followUpInstruction}`;
+  
   const res = await openai.chat.completions.create({
     model: MODEL,
     temperature: 0.2,
     messages: [{ role: 'user', content: prompt }],
     response_format: { type: 'json_object' },
-  })
-  return JSON.parse(res.choices[0].message.content || '{"score":0,"reasoning":"","copiedCodeSignal":false}')
+  });
+
+  return JSON.parse(res.choices[0].message.content || '{"score":0,"reasoning":"","copiedCodeSignal":false}');
 }
 
 // ── Speech to Text (Groq Whisper) ──────────────────────────────
