@@ -520,4 +520,4 @@ export function generateReportPDF(data: ReportData): Readable {
 
   doc.end()
   return doc as unknown as Readable
-}
+} 
