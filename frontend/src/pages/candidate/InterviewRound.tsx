@@ -143,51 +143,64 @@ export default function InterviewRound() {
   }, [])
 
   const handleNext = async () => {
-    const qId = questions[currentIndex].id
-    stopSpeaking(); setSubmitting(true)
+  const qId = questions[currentIndex].id
+  stopSpeaking(); 
+  setSubmitting(true)
 
-    try {
-      let res;
-      if (interviewMode === 'TEXT') {
-        res = await attemptApi.submitInterview({ 
-          attemptId: attempt.id, 
-          questionId: qId, 
-          mode: 'TEXT', 
-          textAnswer: answers[qId] || "",
-          timeTakenSeconds: 0 
-        })
-      } else {
-        let blobToSend = isRecording ? await stopRecording() : audioBlob
-        if (!blobToSend) throw new Error("No audio captured")
-        const fd = new FormData()
-        fd.append('attemptId', attempt.id)
-        fd.append('questionId', qId)
-        fd.append('mode', 'AUDIO')
-        fd.append('audio', blobToSend, `answer-${qId}.webm`)
-        fd.append('timeTakenSeconds', String(audioDuration))
-        res = await attemptApi.submitInterviewAudio(fd)
-      }
+  try {
+    let res;
+    // 1. Submit current answer
+    if (interviewMode === 'TEXT') {
+      res = await attemptApi.submitInterview({ 
+        attemptId: attempt.id, 
+        questionId: qId, 
+        mode: 'TEXT', 
+        textAnswer: answers[qId] || "",
+        timeTakenSeconds: 0 
+      })
+    } else {
+      let blobToSend = isRecording ? await stopRecording() : audioBlob
+      if (!blobToSend) throw new Error("No audio captured")
+      const fd = new FormData()
+      fd.append('attemptId', attempt.id)
+      fd.append('questionId', qId)
+      fd.append('mode', 'AUDIO')
+      fd.append('audio', blobToSend, `answer-${qId}.webm`)
+      fd.append('timeTakenSeconds', String(audioDuration))
+      res = await attemptApi.submitInterviewAudio(fd)
+    }
 
-      if (res.followUp && !activeFollowUp) {
-        toast("Follow-up question coming up...", { icon: '💬' })
-        setActiveFollowUp(res.followUp)
-        setAnswers({ ...answers, [qId]: "" })
-        setAudioBlob(null)
-        setSubmitting(false)
-        return
-      }
+    // 2. CHECK FOR FOLLOW-UP BEFORE INCREMENTING INDEX
+    // If res.followUp exists and we aren't already in a follow-up, show it
+    if (res.followUp && !activeFollowUp) {
+      toast("Follow-up question coming up...", { icon: '💬' })
+      setActiveFollowUp(res.followUp)
+      
+      // Reset input for the follow-up answer
+      setAnswers(prev => ({ ...prev, [qId]: "" }))
+      setAudioBlob(null)
+      setAudioDuration(0)
+      
+      // IMPORTANT: We return early here so currentIndex DOES NOT change
+      setSubmitting(false)
+      return 
+    }
 
-      setActiveFollowUp(null)
-      if (currentIndex < questions.length - 1) {
-        setCurrentIndex(currentIndex + 1)
-      } else {
-        const finishRes = await attemptApi.complete(attempt.id)
-        navigate('/candidate/lobby', { state: { advancement: finishRes.advancement } })
-      }
-    } catch (err: any) {
-      toast.error('Submission failed.')
-    } finally { setSubmitting(false) }
+    // 3. IF NO FOLLOW-UP (OR FOLLOW-UP FINISHED), GO TO NEXT QN
+    setActiveFollowUp(null)
+    if (currentIndex < questions.length - 1) {
+      setCurrentIndex(prev => prev + 1)
+    } else {
+      const finishRes = await attemptApi.complete(attempt.id)
+      navigate('/candidate/lobby', { state: { advancement: finishRes.advancement } })
+    }
+  } catch (err: any) {
+    console.error("Submission failed:", err.response?.data)
+    toast.error('Submission failed.')
+  } finally { 
+    setSubmitting(false) 
   }
+}
 
   const q = questions[currentIndex]
   if (loading || !q) return <div className="p-10 text-center">Loading...</div>
