@@ -1,0 +1,3 @@
+{
+  "app": "npx ts-node cdk-stack-ec2.ts"
+}

@@ -7,7 +7,6 @@ import {
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import Editor from '@monaco-editor/react'
-import axios from 'axios'
 
 
 export default function MixedRound() {
@@ -88,19 +87,21 @@ export default function MixedRound() {
     setConsoleOutput('Executing...')
     try {
       const qId = questions[currentIndex].id
-      let lang = selectedLanguage.toLowerCase()
-      if (lang === 'cpp') lang = 'c++'
-      if (lang === 'javascript') lang = 'node'
-
-      const pistonUrl = import.meta.env.VITE_PISTON_API_URL || 'http://localhost:2000'
-      const { data } = await axios.post(`${pistonUrl}/execute`, {
-        language: selectedLanguage.toLowerCase(),
-        code: codingCodes[qId],
-        stdin: '',
+      const data = await attemptApi.runCoding({
+        attemptId: attempt.id,
+        questionId: qId,
+        sourceCode: codingCodes[qId],
+        language: selectedLanguage,
       })
-      const out = (data.output || '').trim()
-      setConsoleOutput(out || 'Process exited with no output.')
-      toast.success('Execution completed!')
+
+      const lines = (data.results || []).map((result: any) => {
+        const header = `Case ${result.caseIndex + 1}: ${result.passed ? 'PASSED' : 'FAILED'}`
+        return result.actualOutput ? `${header}\n${result.actualOutput}` : header
+      })
+
+      setConsoleOutput(lines.join('\n\n') || 'Execution completed.')
+      if (data.passed === data.total) toast.success('All test cases passed!')
+      else toast.error(`${data.total - data.passed} test case(s) failed.`)
 
       // Save draft to backend
       attemptApi.submitCoding({

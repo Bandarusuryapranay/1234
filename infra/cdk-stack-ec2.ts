@@ -11,8 +11,8 @@ export class Ec2SingleInstanceStack extends cdk.Stack {
     // ----------------------------------------------------------------------
     const instanceTypeParam = new cdk.CfnParameter(this, 'InstanceType', {
       type: 'String',
-      default: 't3.medium',
-      description: 'EC2 instance type (recommended t3.medium or larger)',
+      default: 't3.micro',
+      description: 'EC2 instance type (free-trial default t3.micro; t3.medium recommended for build stability)',
     });
 
     const keyNameParam = new cdk.CfnParameter(this, 'KeyName', {
@@ -77,10 +77,10 @@ export class Ec2SingleInstanceStack extends cdk.Stack {
       description: 'Backend public/base URL used by app links',
     });
 
-    const pistonApiUrlParam = new cdk.CfnParameter(this, 'PistonApiUrl', {
+    const judge0ApiUrlParam = new cdk.CfnParameter(this, 'Judge0ApiUrl', {
       type: 'String',
       default: 'http://judge0-server:2358',
-      description: 'PISTON_API_URL for code execution service',
+      description: 'JUDGE0_API_URL for code execution service',
     });
 
     const groqApiKeyParam = new cdk.CfnParameter(this, 'GroqApiKey', {
@@ -355,9 +355,8 @@ OPENAI_TTS_MODEL="tts-1"
 OPENAI_STT_MODEL="${openAiSttModelParam.valueAsString}"
 GROQ_API_KEY="${groqApiKeyParam.valueAsString}"
 
-JUDGE0_API_URL="http://judge0-server:2358"
+JUDGE0_API_URL="${judge0ApiUrlParam.valueAsString}"
 JUDGE0_API_KEY=""
-PISTON_API_URL="${pistonApiUrlParam.valueAsString}"
 
 AZURE_TENANT_ID="${azureTenantIdParam.valueAsString}"
 AZURE_CLIENT_ID="${azureClientIdParam.valueAsString}"
@@ -546,4 +545,6 @@ docker-compose up -d --build backend
 }
 
 const app = new cdk.App();
-new Ec2SingleInstanceStack(app, 'Ec2DeploymentStack');
+const stackName = app.node.tryGetContext('stackName') || process.env.CDK_STACK_NAME || 'Ec2DeploymentStack';
+
+new Ec2SingleInstanceStack(app, stackName, { stackName });

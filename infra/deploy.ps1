@@ -53,8 +53,11 @@ if ($Action -in @('deploy', 'diff')) {
   }
 
   $stackName = Get-EnvValue -Key 'STACK_NAME' -DefaultValue 'Ec2DeploymentStack'
+  if ($stackName -notmatch '^[A-Za-z][A-Za-z0-9-]{0,127}$') {
+    throw "Invalid STACK_NAME '$stackName'. Use 1-128 chars, start with a letter, and include only letters, numbers, or hyphens."
+  }
   $parameterArgs = @(
-    '--parameters', "InstanceType=$(Get-EnvValue -Key 'INSTANCE_TYPE' -DefaultValue 't3.medium')",
+    '--parameters', "InstanceType=$(Get-EnvValue -Key 'INSTANCE_TYPE' -DefaultValue 't3.micro')",
     '--parameters', "KeyName=$(Get-EnvValue -Key 'KEY_NAME')",
     '--parameters', "RepoUrl=$(Get-EnvValue -Key 'REPO_URL')",
     '--parameters', "RepoBranch=$(Get-EnvValue -Key 'REPO_BRANCH' -DefaultValue 'main')",
@@ -72,7 +75,7 @@ if ($Action -in @('deploy', 'diff')) {
     '--parameters', "OpenAiBaseUrl=$(Get-EnvValue -Key 'OPENAI_BASE_URL' -DefaultValue 'https://api.groq.com/openai/v1')",
     '--parameters', "OpenAiModel=$(Get-EnvValue -Key 'OPENAI_MODEL' -DefaultValue 'llama-3.3-70b-versatile')",
     '--parameters', "OpenAiSttModel=$(Get-EnvValue -Key 'OPENAI_STT_MODEL' -DefaultValue 'whisper-large-v3-turbo')",
-    '--parameters', "PistonApiUrl=$(Get-EnvValue -Key 'PISTON_API_URL' -DefaultValue 'http://judge0-server:2358')",
+    '--parameters', "Judge0ApiUrl=$(Get-EnvValue -Key 'JUDGE0_API_URL' -DefaultValue 'http://judge0-server:2358')",
     '--parameters', "SmtpHost=$(Get-EnvValue -Key 'SMTP_HOST' -DefaultValue 'smtp.gmail.com')",
     '--parameters', "SmtpPort=$(Get-EnvValue -Key 'SMTP_PORT' -DefaultValue '587')",
     '--parameters', "SmtpSecure=$(Get-EnvValue -Key 'SMTP_SECURE' -DefaultValue 'false')",
@@ -90,7 +93,7 @@ if ($Action -in @('deploy', 'diff')) {
   )
 }
 
-$cdkArgs = @($Action, '--app', 'npx ts-node cdk-stack-ec2.ts', $stackName)
+$cdkArgs = @($Action, '--app', 'npx ts-node cdk-stack-ec2.ts', '--context', "stackName=$stackName", $stackName)
 
 if ($Action -eq 'deploy') {
   $cdkArgs += @('--require-approval', 'never')

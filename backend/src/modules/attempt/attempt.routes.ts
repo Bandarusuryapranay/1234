@@ -57,13 +57,17 @@ async function submitLiveCodingCode(req: Request, res: Response, next: NextFunct
 
 async function submitLiveCodingExplain(req: Request, res: Response, next: NextFunction) {
   try {
-    const { attemptId, answerId, questionId, audioUrl } = SubmitLiveCodingExplainDto.parse(req.body)
+    const { attemptId, answerId, questionId } = SubmitLiveCodingExplainDto.parse(req.body)
+
+    if (!req.file?.buffer) {
+      throw { status: 400, message: 'Audio file is required' }
+    }
 
     const result = await AttemptService.submitLiveCodingExplanation({
       attemptId,
       answerId,
       questionId,
-      audioUrl,
+      audioBuffer: req.file.buffer,
     })
 
     res.json(result)
@@ -96,5 +100,5 @@ attemptRouter.post('/submit/mcq', submitMCQ)
 attemptRouter.post('/submit/coding', submitCoding)
 attemptRouter.post('/submit/interview', submitInterview)
 attemptRouter.post('/live-coding/code', submitLiveCodingCode)
-attemptRouter.post('/live-coding/explain', submitLiveCodingExplain)
+attemptRouter.post('/live-coding/explain', audioUpload.single('audio'), submitLiveCodingExplain)
 attemptRouter.post('/complete', complete)
