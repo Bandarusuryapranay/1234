@@ -1,0 +1,22 @@
+{
+  "name": "smarthire-infra",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc --noEmit",
+    "synth": "npx cdk synth --app \"npx ts-node cdk-stack-ec2.ts\"",
+    "diff": "npx cdk diff --app \"npx ts-node cdk-stack-ec2.ts\"",
+    "deploy": "npx cdk deploy --app \"npx ts-node cdk-stack-ec2.ts\"",
+    "destroy": "npx cdk destroy --app \"npx ts-node cdk-stack-ec2.ts\"",
+    "diff:env": "powershell -ExecutionPolicy Bypass -File ./deploy.ps1 -Action diff",
+    "deploy:env": "powershell -ExecutionPolicy Bypass -File ./deploy.ps1 -Action deploy"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.0.0",
+    "constructs": "^10.0.0"
+  },
+  "devDependencies": {
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.2"
+  }
+}

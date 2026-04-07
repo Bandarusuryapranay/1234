@@ -1,16 +1,17 @@
-# AWS CDK Migration & Deployment Guide
+# AWS CDK Migration & Deployment Guide (Single-Node EC2)
 
-This guide provides a step-by-step walkthrough for migrating the SmartHire AI project to **AWS CDK** for Infrastructure-as-Code (IaC) and deploying it to the AWS Cloud.
+This guide provides a step-by-step walkthrough for deploying the custom **Node.js (Express + Prisma)** backend alongside the **Judge0** code execution system to a single AWS EC2 instance using **AWS CDK**.
 
 ## 🏗️ Architecture Overview
 
-The recommended architecture for this stack on AWS is:
-- **Frontend:** React (Vite) hosted in **Amazon S3** and distributed via **Amazon CloudFront**.
-- **Backend:** Express API running on **AWS Fargate (ECS)** with an Application Load Balancer (ALB).
-- **Database:** **Amazon RDS (Aurora PostgreSQL)** for persistent data.
-- **Cache/Queue:** **Amazon ElastiCache (Redis)** for Bull MQ background jobs.
-- **Media Storage:** **Amazon S3** (migrating from local/Cloudinary if preferred).
-- **Secret Management:** **AWS Secrets Manager**.
+The recommended architecture for this stack is highly cost-effective and specifically tailored for staging environments or low-traffic platforms.
+
+- **Infrastructure:** AWS EC2 (t3.medium recommended) provisioned via AWS CDK.
+- **Orchestration:** Docker Compose running natively on the EC2 instance.
+- **Backend:** Node.js (Express) built and run natively in a container on port 4000.
+- **Code Execution:** Judge0 CE Server and Worker containers.
+- **Database / Cache:** PostgreSQL (for backend + Judge0) and Redis (for Judge0 queues).
+- **Reverse Proxy:** Nginx routing incoming HTTP traffic on port 80 to the Node.js backend.
 
 ---
 
@@ -18,137 +19,82 @@ The recommended architecture for this stack on AWS is:
 
 Before starting, ensure you have:
 1.  **AWS Account** with CLI access configured (`aws configure`).
-2.  **Node.js** installed.
-3.  **AWS CDK CLI** installed:
-    ```bash
-    npm install -g aws-cdk
-    ```
-4.  **Docker** installed (required for bundling the backend container).
+2.  **Node.js** installed locally.
 
 ---
 
-## 📦 Step 2: Initialize the CDK Project
+## 📦 Step 2: Running the Stack
 
-Create a new directory for your infrastructure and initialize CDK:
+The infrastructure code now lives in `infra/cdk-stack-ec2.ts` with a dedicated `infra/package.json` for CDK tooling.
+
+### 1. Install Dependencies
 
 ```bash
-mkdir smarthire-infra && cd smarthire-infra
-cdk init app --language typescript
+cd infra
+npm install
 ```
 
----
+### 2. Create Deployment Env File
 
-## 🛠️ Step 3: Define the Infrastructure (The CDK Code)
-
-In your `lib/smarthire-stack.ts`, define the core resources.
-
-### 1. Networking (VPC)
-```typescript
-const vpc = new ec2.Vpc(this, 'SmartHireVpc', { maxAzs: 2 });
-```
-
-### 2. Database (Aurora PostgreSQL)
-```typescript
-const cluster = new rds.DatabaseCluster(this, 'SmartHireDB', {
-  engine: rds.DatabaseClusterEngine.auroraPostgres({ version: rds.AuroraPostgresEngineVersion.VER_15_2 }),
-  credentials: rds.Credentials.fromGeneratedSecret('dbadmin'),
-  instanceProps: { vpc, instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MEDIUM) },
-});
-```
-
-### 3. Backend Service (ECS Fargate)
-```typescript
-const fargateService = new ecs_patterns.ApplicationLoadBalancedFargateService(this, 'ApiService', {
-  vpc,
-  cpu: 512,
-  memoryLimitMiB: 1024,
-  taskImageOptions: {
-    image: ecs.ContainerImage.fromAsset('../backend'), // Points to your backend folder
-    environment: {
-      DATABASE_URL: `postgresql://...`, // Pulled from Secrets Manager
-      GROQ_API_KEY: process.env.GROQ_API_KEY!,
-    },
-  },
-  publicLoadBalancer: true,
-});
-```
-
-### 4. Frontend Deployment (S3 + CloudFront)
-```typescript
-const siteBucket = new s3.Bucket(this, 'SiteBucket', {
-  websiteIndexDocument: 'index.html',
-  publicReadAccess: true,
-});
-
-new s3_deployment.BucketDeployment(this, 'DeployWebsite', {
-  sources: [s3_deployment.Source.asset('../frontend/dist')],
-  destinationBucket: siteBucket,
-});
-
-const distribution = new cloudfront.CloudFrontWebDistribution(this, 'SiteDistribution', {
-  originConfigs: [{
-    s3OriginSource: { s3BucketSource: siteBucket },
-    behaviors: [{ isDefaultBehavior: true }],
-  }],
-});
-```
-
----
-
-## 🏗️ Step 4: Dockerize the Backend
-
-Ensure your `backend/Dockerfile` is ready:
-
-```dockerfile
-FROM node:20-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install
-COPY . .
-RUN npx prisma generate
-RUN npm run build
-EXPOSE 3000
-CMD ["npm", "start"]
-```
-
----
-
-## 🚢 Step 5: Deployment Workflow
-
-### 1. Bootstrap AWS
-Required once per account/region to set up internal CDK storage:
 ```bash
-cdk bootstrap
+cp .env.deploy.example .env.deploy.local
 ```
 
-### 2. Prepare Frontend
-Build the Vite app locally so CDK can pick up the `/dist` folder:
+Fill `.env.deploy.local` with your real values (`KEY_NAME`, `REPO_URL`, `DATABASE_URL`, JWT values, API keys, SMTP, Cloudinary, Azure values).
+
+If you use an external database (for example Supabase), set `DATABASE_URL` in `.env.deploy.local` and the stack will inject it into backend `.env` instead of using local postgres for backend data.
+
+### 3. Bootstrap CDK (Once Per Account + Region)
+
 ```bash
-cd ../frontend
-npm install && npm run build
-cd ../smarthire-infra
+npx cdk bootstrap
 ```
 
-### 3. Deploy
-This will compile the TS, build the Docker image, upload to ECR, and create all AWS resources:
+### 4. Preview the Deployment
+
 ```bash
-cdk deploy
+npm run diff:env
+```
+
+### 5. Deploy
+Deploy using values from `.env.deploy.local`.
+
+```bash
+npm run deploy:env
+```
+
+You can still run raw CDK commands if needed:
+
+```bash
+npm run deploy -- --require-approval never --parameters KeyName="..." --parameters RepoUrl="..."
 ```
 
 ---
 
-## ⚙️ Step 6: Post-Deployment Configuration
+## 🛠️ Step 3: What Happens During Deployment?
 
-1.  **Database Migration:** Use a bastion host or a temporary Lambda task to run `npx prisma db push` against the RDS instance.
-2.  **Environment Variables:** Update your [.env](file:///d:/Indium/backend/.env) secrets in **AWS Secrets Manager**.
-3.  **DNS:** Update your domain (e.g., Route53) to point to the CloudFront distribution URL.
+Once the CDK finishes provisioning the EC2 instance, the **User Data bootstrap script** takes over asynchronously:
 
-## 💡 Best Practices
-
-- **CI/CD:** Use **AWS CodePipeline** or **GitHub Actions** to automate `cdk deploy`.
-- **Cost Management:** Use `t3.micro` or `t3.small` for dev environments to save costs.
-- **Security:** Ensure the Database is in a private subnet and only accessible by the Fargate tasks.
+1. **System Setup:** Installs Docker, Docker Compose, Git, Nginx, and `pwgen`.
+2. **Swap File Creation:** Crucially allocates 2GB of swap space to prevent the instance from running out of memory during the `npm run build` phase.
+3. **Fetching the Repo:** Clones your backend repository directly into the instance.
+4. **Environment Variables:** Generates randomized Postgres/JWT secrets and creates `.env` with all required backend keys (`DATABASE_URL`, JWT keys, `OPENAI_*`, `GROQ_API_KEY`, Azure Graph settings, `CLIENT_URL`, `FRONTEND_URL`, Judge0 URLs).
+5. **Docker Build & Launch:** 
+   - Starts Postgres and Redis.
+   - Waits dynamically for Postgres to become healthy.
+   - Bootstraps the Dockerfile to `npm install`, compile Prisma, and build Node.
+   - Starts Judge0 and the Backend.
+6. **Database Migration:** Executes `npx prisma db push` before finally starting your Node.js server.
 
 ---
 
-*This guide provides a high-level template. You may need to adjust specific instance sizes and IAM roles based on your actual traffic and security requirements.*
+## ⚙️ Step 4: Post-Deployment Configuration
+
+1. **Viewing Your IP:** Once the `cdk deploy` finishes, it will output your instance's public IP address (e.g., `InstancePublicIp: 54.123.x.x`). You can access your backend by navigating to `http://<YOUR_IP>`.
+2. **Updating Code:** To release new code, you can SSH into your instance, pull the latest changes, and restart the backend container, or re-run the CDK deployment (which will replace the instance due to User Data changes).
+3. **HTTPS / Domain:** To secure Nginx, attach an Elastic IP or point a domain to the instance and execute `certbot`.
+
+## 💡 Best Practices & Risks
+
+- **Memory Usage:** The Node.js compilation and Prisma client generation process is heavy. A minimum of `t3.medium` is recommended. The script uses a 2GB swap file as a safeguard, but `t3.micro` sizes may still experience instability during builds.
+- **Statefulness:** Because this is a single EC2 instance with dockerized PostgreSQL mapping to an EBS volume, replacing the instance (via CDK updates to the User Data script) will result in **data loss** unless the EBS volume is retained or snapshot backups are regularly taken. For production, consider externalizing the database to RDS.
